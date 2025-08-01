@@ -2,6 +2,9 @@
 
 **Secify** is a secure file encryption program. It transforms any file or folder into an encrypted `.sec` container that can only be opened with the correct password.
 
+## Note
+This is just a personal project, to explore different encryption methods.
+
 ## Key Features
 
 - **Multiple Encryption Algorithms**: AES-256-GCM, ChaCha20-Poly1305, and XChaCha20-Poly1305
@@ -84,7 +87,6 @@ Secify uses Argon2id for key derivation with customizable parameters:
 - **Fast/Mobile**: `--memory-mb 32 --time-cost 4 --parallelism 2`
 - **Balanced**: `--memory-mb 128 --time-cost 8 --parallelism 4` (default)
 - **High Security**: `--memory-mb 512 --time-cost 16 --parallelism 8`
-- **Server/Batch**: `--memory-mb 1024 --time-cost 12 --parallelism 16`
 
 ## File Format: Securely Encrypted Container (.sec)
 
@@ -201,14 +203,3 @@ Zipping directory...
 [████████████████████] 100% - Encryption complete
 Directory zipped and encrypted successfully: /home/user/documents.sec
 ```
-
-## Error Handling
-
-Secify provides clear error messages for common issues:
-
-- **Wrong Password**: "Failed to decrypt data - incorrect password or corrupted file"
-- **Corrupted File**: "Invalid encrypted file format"
-- **Version Mismatch**: "Unsupported file format version"
-- **Missing Files**: "Failed to read file: [filename]"
-
-
