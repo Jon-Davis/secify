@@ -186,13 +186,11 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
         validate_file_size(path)?;
     }
     
-    // Generate cryptographically secure random salt and nonce
+    // Generate cryptographically secure random salt and base nonce for chunked encryption
     let mut salt = [0u8; SALT_LENGTH];
-    let nonce_length = algorithm.nonce_length();
-    let mut nonce_bytes = vec![0u8; nonce_length];
+    let base_nonce = generate_base_nonce(algorithm)?;
     
     generate_secure_random_bytes(&mut salt)?;
-    generate_secure_random_bytes(&mut nonce_bytes)?;
     
     // Derive encryption key from password and salt (this is the slow step)
     let key = derive_key(password, &salt, &argon2_params)?;
@@ -210,22 +208,29 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
         (file_data, false)
     };
     
-    // Encrypt the data
+    // Encrypt the data using chunked encryption for all algorithms
     println!("Encrypting data...");
-    let ciphertext = encrypt_data(&algorithm, &key, &nonce_bytes, &input_data)?;
+    let ciphertext = encrypt_data_chunked(&algorithm, &key, &base_nonce, &input_data, DEFAULT_CHUNK_SIZE)?;
     
-    // Create CBOR header with encryption details
-    let header = create_encryption_header(&salt, &nonce_bytes, is_directory, &algorithm, &argon2_params);
+    // Compute HMAC of the plaintext for file integrity verification
+    println!("Computing file integrity checksum...");
+    let hmac = compute_hmac(&input_data, &key, &salt)?;
+    
+    // Create CBOR header with encryption details including chunk size
+    let header = create_encryption_header(&salt, &base_nonce, is_directory, &algorithm, &argon2_params, DEFAULT_CHUNK_SIZE as u32);
     let cbor_header = serialize_header_to_cbor(&header)?;
     
     // Create output file structure: 
     // 4 bytes: CBOR header length (little-endian u32)
+    // N bytes: CBOR header
+    // remaining: ciphertext + HMAC (32 bytes)
     // N bytes: CBOR header
     // remaining: ciphertext
     let mut output_data = Vec::new();
     output_data.extend_from_slice(&(cbor_header.len() as u32).to_le_bytes());
     output_data.extend_from_slice(&cbor_header);
     output_data.extend_from_slice(&ciphertext);
+    output_data.extend_from_slice(&hmac); // Append HMAC at end of file
     
     // Write to .sec file with progress
     // Remove trailing path separators before adding .sec extension
@@ -290,7 +295,14 @@ pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
     
     // Extract CBOR header and ciphertext
     let cbor_header_data = &encrypted_data[4..4 + header_length];
-    let ciphertext = &encrypted_data[4 + header_length..];
+    let remaining_data = &encrypted_data[4 + header_length..];
+    
+    // Extract HMAC (last 32 bytes) and ciphertext (everything before HMAC)
+    if remaining_data.len() < 32 {
+        bail!("Invalid encrypted file format - missing HMAC");
+    }
+    let ciphertext = &remaining_data[..remaining_data.len() - 32];
+    let stored_hmac = &remaining_data[remaining_data.len() - 32..];
     
     // Deserialize and validate header
     let header = deserialize_header_from_cbor(cbor_header_data)?;
@@ -305,6 +317,7 @@ pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
              header.kdf.time_cost,
              header.kdf.parallelism);
     println!("Content type: {:?}", header.content_type);
+    println!("Chunked encryption: {}KB chunks", header.chunk_size / 1024);
     
     let is_directory = matches!(header.content_type, ContentType::Directory);
     
@@ -321,14 +334,21 @@ pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
     // Derive decryption key from password and salt from header
     let key = derive_key(password, &header.salt, &argon2_params)?;
     
-    // Decrypt the data
+    // Decrypt the data using chunked decryption
     println!("Decrypting data...");
     let decrypt_pb = create_byte_progress_bar(ciphertext.len() as u64, "Decrypting");
     
-    let plaintext = decrypt_data(&algorithm, &key, &header.nonce, ciphertext)?;
+    let plaintext = decrypt_data_chunked(&algorithm, &key, &header.nonce, ciphertext, header.chunk_size as usize)?;
     
     decrypt_pb.inc(ciphertext.len() as u64);
     decrypt_pb.finish_with_message("Decryption complete");
+    
+    // Verify HMAC for file integrity
+    println!("Verifying file integrity...");
+    if !verify_hmac(&plaintext, &key, &header.salt, stored_hmac)? {
+        bail!("File integrity verification failed - file may be corrupted or tampered with");
+    }
+    println!("File integrity verified successfully");
     
     // Determine output path (remove .sec extension)
     let output_path = &file_path[..file_path.len() - 4];

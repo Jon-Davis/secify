@@ -24,6 +24,8 @@ fn main() -> Result<()> {
             } else {
                 println!("Detected non-.sec file - encrypting...");
                 println!("Using encryption algorithm: {}", cli.algorithm.to_string());
+                println!("Using chunked encryption: {}KB chunks for optimal memory usage", 
+                         crypto::DEFAULT_CHUNK_SIZE / 1024);
                 println!("Using Argon2id parameters: {}MB memory, {} iterations, {} threads", 
                          argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
                 file_operations::encrypt_file(&file, &password, &cli.algorithm, &argon2_params)?;

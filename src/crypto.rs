@@ -8,12 +8,15 @@ use argon2::{Argon2, Algorithm, Version, Params, PasswordHasher};
 use argon2::password_hash::{rand_core::RngCore, SaltString};
 use serde::{Serialize, Deserialize};
 use std::time::Instant;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 // Constants
 pub const SALT_LENGTH: usize = 32;
 pub const KEY_LENGTH: usize = 32;
 pub const FILE_FORMAT_VERSION: u32 = 1;
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB limit to prevent OOM
+pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks for streaming encryption
 
 // Default Argon2 parameters
 pub const DEFAULT_MEMORY_MB: u32 = 128;
@@ -103,6 +106,14 @@ impl EncryptionAlgorithm {
             EncryptionAlgorithm::XChaCha20Poly1305 => 24,  // XChaCha20-Poly1305 uses 192-bit nonces
         }
     }
+    
+    pub fn auth_tag_size(&self) -> usize {
+        match self {
+            EncryptionAlgorithm::Aes256Gcm => 16,          // AES-GCM uses 128-bit auth tags
+            EncryptionAlgorithm::ChaCha20Poly1305 => 16,   // ChaCha20-Poly1305 uses 128-bit auth tags
+            EncryptionAlgorithm::XChaCha20Poly1305 => 16,  // XChaCha20-Poly1305 uses 128-bit auth tags
+        }
+    }
 }
 
 pub fn parse_algorithm(s: &str) -> Result<EncryptionAlgorithm, String> {
@@ -128,8 +139,10 @@ pub struct EncryptionHeader {
     pub content_type: ContentType,
     /// Salt for key derivation
     pub salt: Vec<u8>,
-    /// Nonce/IV for encryption
+    /// Nonce/IV for encryption (base nonce for chunked encryption)
     pub nonce: Vec<u8>,
+    /// Chunk size used for streaming encryption 
+    pub chunk_size: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -238,6 +251,69 @@ pub fn encrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], non
     }
 }
 
+/// Encrypt data in chunks for streaming encryption with fixed chunk sizes
+pub fn encrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], base_nonce: &[u8], data: &[u8], chunk_size: usize) -> Result<Vec<u8>> {
+    if chunk_size == 0 {
+        bail!("Chunk size cannot be zero");
+    }
+    
+    let auth_tag_size = algorithm.auth_tag_size();
+    if chunk_size <= auth_tag_size {
+        bail!("Chunk size must be larger than authentication tag size ({} bytes)", auth_tag_size);
+    }
+    
+    // Calculate plaintext size per chunk to ensure fixed encrypted chunk size
+    let plaintext_chunk_size = chunk_size - auth_tag_size;
+    
+    let mut result = Vec::new();
+    let mut chunk_counter: u64 = 0;
+    
+    for chunk in data.chunks(plaintext_chunk_size) {
+        let chunk_nonce = create_chunk_nonce(algorithm, base_nonce, chunk_counter)?;
+        let encrypted_chunk = encrypt_data(algorithm, key, &chunk_nonce, chunk)?;
+        
+        // Verify the encrypted chunk size is as expected (except for the last chunk)
+        let expected_size = chunk.len() + auth_tag_size;
+        if encrypted_chunk.len() != expected_size {
+            bail!("Unexpected encrypted chunk size: got {}, expected {}", encrypted_chunk.len(), expected_size);
+        }
+        
+        // Store encrypted chunk directly without length prefix
+        result.extend_from_slice(&encrypted_chunk);
+        
+        chunk_counter += 1;
+    }
+    
+    Ok(result)
+}
+
+/// Create a unique nonce for each chunk by combining base nonce with chunk counter
+fn create_chunk_nonce(algorithm: &EncryptionAlgorithm, base_nonce: &[u8], chunk_counter: u64) -> Result<Vec<u8>> {
+    let nonce_length = algorithm.nonce_length();
+    let mut chunk_nonce = vec![0u8; nonce_length];
+    
+    match algorithm {
+        EncryptionAlgorithm::Aes256Gcm | EncryptionAlgorithm::ChaCha20Poly1305 => {
+            // 96-bit nonces: 8 bytes base + 4 bytes counter
+            if base_nonce.len() != 8 {
+                bail!("Base nonce for {}/ChaCha20 must be 8 bytes, got {}", algorithm.to_string(), base_nonce.len());
+            }
+            chunk_nonce[..8].copy_from_slice(base_nonce);
+            chunk_nonce[8..12].copy_from_slice(&(chunk_counter as u32).to_le_bytes());
+        }
+        EncryptionAlgorithm::XChaCha20Poly1305 => {
+            // 192-bit nonces: 16 bytes base + 8 bytes counter
+            if base_nonce.len() != 16 {
+                bail!("Base nonce for XChaCha20 must be 16 bytes, got {}", base_nonce.len());
+            }
+            chunk_nonce[..16].copy_from_slice(base_nonce);
+            chunk_nonce[16..24].copy_from_slice(&chunk_counter.to_le_bytes());
+        }
+    }
+    
+    Ok(chunk_nonce)
+}
+
 pub fn decrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     match algorithm {
         EncryptionAlgorithm::Aes256Gcm => {
@@ -264,7 +340,34 @@ pub fn decrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], non
     }
 }
 
-pub fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool, algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params) -> EncryptionHeader {
+/// Decrypt chunked data for streaming decryption with fixed chunk sizes
+pub fn decrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], base_nonce: &[u8], ciphertext: &[u8], chunk_size: usize) -> Result<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut chunk_counter: u64 = 0;
+    let mut offset = 0;
+    
+    while offset < ciphertext.len() {
+        // Calculate current chunk size - try for full chunk_size, but accept smaller for last chunk
+        let remaining_ciphertext = ciphertext.len() - offset;
+        let current_chunk_size = remaining_ciphertext.min(chunk_size);
+        
+        // Extract chunk data
+        let chunk_data = &ciphertext[offset..offset + current_chunk_size];
+        
+        // Create chunk nonce and decrypt
+        let chunk_nonce = create_chunk_nonce(algorithm, base_nonce, chunk_counter)?;
+        let decrypted_chunk = decrypt_data(algorithm, key, &chunk_nonce, chunk_data)?;
+        
+        result.extend_from_slice(&decrypted_chunk);
+        
+        offset += current_chunk_size;
+        chunk_counter += 1;
+    }
+    
+    Ok(result)
+}
+
+pub fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool, algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32) -> EncryptionHeader {
     EncryptionHeader {
         version: FILE_FORMAT_VERSION,
         encryption_algorithm: algorithm.to_string().to_owned(),
@@ -283,7 +386,20 @@ pub fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool, a
         content_type: if is_directory { ContentType::Directory } else { ContentType::File },
         salt: salt.to_vec(),
         nonce: nonce.to_vec(),
+        chunk_size,
     }
+}
+
+/// Generate base nonce for chunked encryption (shorter than full nonce to leave room for counter)
+pub fn generate_base_nonce(algorithm: &EncryptionAlgorithm) -> Result<Vec<u8>> {
+    let base_nonce_length = match algorithm {
+        EncryptionAlgorithm::Aes256Gcm | EncryptionAlgorithm::ChaCha20Poly1305 => 8, // 8 bytes base + 4 bytes counter = 12 bytes total
+        EncryptionAlgorithm::XChaCha20Poly1305 => 16, // 16 bytes base + 8 bytes counter = 24 bytes total
+    };
+    
+    let mut base_nonce = vec![0u8; base_nonce_length];
+    generate_secure_random_bytes(&mut base_nonce)?;
+    Ok(base_nonce)
 }
 
 pub fn serialize_header_to_cbor(header: &EncryptionHeader) -> Result<Vec<u8>> {
@@ -319,13 +435,46 @@ pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
         bail!("Invalid salt length: expected {}, got {}", SALT_LENGTH, header.salt.len());
     }
     
-    let expected_nonce_length = algorithm.nonce_length();
-    if header.nonce.len() != expected_nonce_length {
-        bail!("Invalid nonce length for {}: expected {}, got {}", 
-              algorithm.to_string(), expected_nonce_length, header.nonce.len());
+    // Validate base nonce length for chunked encryption
+    let expected_base_nonce_length = match algorithm {
+        EncryptionAlgorithm::Aes256Gcm | EncryptionAlgorithm::ChaCha20Poly1305 => 8,
+        EncryptionAlgorithm::XChaCha20Poly1305 => 16,
+    };
+    
+    if header.nonce.len() != expected_base_nonce_length {
+        bail!("Invalid base nonce length for {} (chunked): expected {}, got {}", 
+              algorithm.to_string(), expected_base_nonce_length, header.nonce.len());
+    }
+    
+    // Ensure chunk_size is valid for chunked encryption
+    if header.chunk_size == 0 {
+        bail!("Invalid chunk size: chunked encryption requires chunk_size > 0");
     }
     
     Ok(())
+}
+
+/// Compute HMAC-SHA256 of plaintext data using key derived from password and salt
+pub fn compute_hmac(plaintext: &[u8], key: &[u8; KEY_LENGTH], salt: &[u8]) -> Result<Vec<u8>> {
+    type HmacSha256 = Hmac<Sha256>;
+    
+    // Create HMAC key by combining encryption key with salt
+    let mut hmac_key = Vec::with_capacity(KEY_LENGTH + salt.len());
+    hmac_key.extend_from_slice(key);
+    hmac_key.extend_from_slice(salt);
+    
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&hmac_key)
+        .map_err(|e| anyhow::anyhow!("Failed to create HMAC: {}", e))?;
+    
+    mac.update(plaintext);
+    let result = mac.finalize();
+    Ok(result.into_bytes().to_vec())
+}
+
+/// Verify HMAC-SHA256 of plaintext data
+pub fn verify_hmac(plaintext: &[u8], key: &[u8; KEY_LENGTH], salt: &[u8], expected_hmac: &[u8]) -> Result<bool> {
+    let computed_hmac = compute_hmac(plaintext, key, salt)?;
+    Ok(computed_hmac == expected_hmac)
 }
 
 #[cfg(test)]
@@ -342,6 +491,18 @@ mod tests {
     
     fn create_test_nonce(algorithm: &EncryptionAlgorithm) -> Vec<u8> {
         vec![2u8; algorithm.nonce_length()] // Fixed nonce for reproducible tests
+    }
+
+    fn create_test_base_nonce(algorithm: &EncryptionAlgorithm) -> Vec<u8> {
+        match algorithm {
+            EncryptionAlgorithm::Aes256Gcm | EncryptionAlgorithm::ChaCha20Poly1305 => vec![2u8; 8],
+            EncryptionAlgorithm::XChaCha20Poly1305 => vec![2u8; 16],
+        }
+    }
+
+    fn create_fast_test_params() -> Argon2Params {
+        // Use minimal parameters for fast testing
+        Argon2Params::new(8, 1, 1).unwrap() // 8MB memory, 1 iteration, 1 thread
     }
 
     #[test]
@@ -416,7 +577,7 @@ mod tests {
     #[test]
     fn test_derive_key_consistency() {
         let salt = create_test_salt();
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         
         // Same password and salt should produce same key
         let key1 = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
@@ -438,7 +599,7 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt data
@@ -456,7 +617,7 @@ mod tests {
         let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt data
@@ -474,7 +635,7 @@ mod tests {
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt data
@@ -492,7 +653,7 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt with correct key
@@ -509,7 +670,7 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt with correct nonce
@@ -525,11 +686,11 @@ mod tests {
     fn test_create_encryption_header() {
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
         let salt = create_test_salt();
-        let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
         
-        // Test file header
-        let header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
+        // Test file header with chunked encryption
+        let header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         assert_eq!(header.version, FILE_FORMAT_VERSION);
         assert_eq!(header.encryption_algorithm, "XChaCha20-Poly1305");
         assert_eq!(header.kdf.algorithm, "Argon2id");
@@ -539,21 +700,23 @@ mod tests {
         assert_eq!(header.compression.enabled, false);
         assert!(matches!(header.content_type, ContentType::File));
         assert_eq!(header.salt, salt.to_vec());
-        assert_eq!(header.nonce, nonce);
+        assert_eq!(header.nonce, base_nonce);
+        assert_eq!(header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
         
-        // Test directory header
-        let dir_header = create_encryption_header(&salt, &nonce, true, &algorithm, &params);
+        // Test directory header with chunked encryption (removed legacy mode test since we don't support it)
+        let dir_header = create_encryption_header(&salt, &base_nonce, true, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         assert_eq!(dir_header.compression.enabled, true);
         assert!(matches!(dir_header.content_type, ContentType::Directory));
+        assert_eq!(dir_header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
     }
 
     #[test]
     fn test_serialize_deserialize_header_cbor() {
         let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
         let salt = create_test_salt();
-        let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
-        let original_header = create_encryption_header(&salt, &nonce, true, &algorithm, &params);
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let original_header = create_encryption_header(&salt, &base_nonce, true, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Serialize to CBOR
         let cbor_data = serialize_header_to_cbor(&original_header).unwrap();
@@ -569,15 +732,16 @@ mod tests {
         assert_eq!(original_header.kdf.memory_cost, deserialized_header.kdf.memory_cost);
         assert_eq!(original_header.salt, deserialized_header.salt);
         assert_eq!(original_header.nonce, deserialized_header.nonce);
+        assert_eq!(original_header.chunk_size, deserialized_header.chunk_size);
     }
 
     #[test]
     fn test_validate_header_success() {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
-        let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
-        let header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Valid header should pass validation
         assert!(validate_header(&header).is_ok());
@@ -587,9 +751,9 @@ mod tests {
     fn test_validate_header_invalid_version() {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
-        let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid version
         header.version = FILE_FORMAT_VERSION + 1;
@@ -600,9 +764,9 @@ mod tests {
     fn test_validate_header_invalid_algorithm() {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
-        let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid algorithm
         header.encryption_algorithm = "Invalid-Algorithm".to_string();
@@ -613,9 +777,9 @@ mod tests {
     fn test_validate_header_invalid_kdf() {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
-        let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid KDF
         header.kdf.algorithm = "PBKDF2".to_string();
@@ -626,9 +790,9 @@ mod tests {
     fn test_validate_header_invalid_salt_length() {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
-        let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid salt length
         header.salt = vec![1u8; 16]; // Wrong length
@@ -639,19 +803,19 @@ mod tests {
     fn test_validate_header_invalid_nonce_length() {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
-        let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
-        // Set invalid nonce length
-        header.nonce = vec![2u8; 8]; // Wrong length for AES-GCM
+        // Set invalid nonce length (AES-GCM expects 8-byte base nonce, so use 4 bytes to make it invalid)
+        header.nonce = vec![2u8; 4]; // Wrong length for AES-GCM base nonce
         assert!(validate_header(&header).is_err());
     }
 
     #[test]
     fn test_encryption_algorithms_are_not_interchangeable() {
         let salt = create_test_salt();
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt with AES-256-GCM
@@ -671,7 +835,7 @@ mod tests {
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         let empty_data = b"";
@@ -690,7 +854,7 @@ mod tests {
         let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let params = Argon2Params::default();
+        let params = create_fast_test_params();
         let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Create 1MB of test data
@@ -703,5 +867,121 @@ mod tests {
         // Decrypt large data
         let plaintext = decrypt_data(&algorithm, &key, &nonce, &ciphertext).unwrap();
         assert_eq!(plaintext, large_data);
+    }
+
+    #[test]
+    fn test_chunked_encryption_aes256gcm() {
+        let algorithm = EncryptionAlgorithm::Aes256Gcm;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        let test_data = b"This is test data for chunked encryption with multiple chunks to verify it works correctly across chunk boundaries.";
+        let chunk_size = 32; // Small chunk size to test multiple chunks
+        
+        // Encrypt data using chunked encryption
+        let ciphertext = encrypt_data_chunked(&algorithm, &key, &base_nonce, test_data, chunk_size).unwrap();
+        assert!(ciphertext.len() > test_data.len()); // Should be larger due to chunk headers and auth tags
+        
+        // Decrypt data using chunked decryption
+        let plaintext = decrypt_data_chunked(&algorithm, &key, &base_nonce, &ciphertext, chunk_size).unwrap();
+        assert_eq!(plaintext, test_data);
+    }
+
+    #[test]
+    fn test_chunked_encryption_chacha20poly1305() {
+        let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        let test_data = b"Another test for ChaCha20-Poly1305 chunked encryption functionality.";
+        let chunk_size = 32; // Chunk size must be larger than auth tag size (16 bytes)
+        
+        // Encrypt data using chunked encryption
+        let ciphertext = encrypt_data_chunked(&algorithm, &key, &base_nonce, test_data, chunk_size).unwrap();
+        assert!(ciphertext.len() > test_data.len());
+        
+        // Decrypt data using chunked decryption
+        let plaintext = decrypt_data_chunked(&algorithm, &key, &base_nonce, &ciphertext, chunk_size).unwrap();
+        assert_eq!(plaintext, test_data);
+    }
+
+    #[test]
+    fn test_chunked_encryption_xchacha20poly1305() {
+        let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        let test_data = b"Testing XChaCha20-Poly1305 with chunked encryption and larger data sets.";
+        let chunk_size = DEFAULT_CHUNK_SIZE; // Use default chunk size
+        
+        // Encrypt data using chunked encryption
+        let ciphertext = encrypt_data_chunked(&algorithm, &key, &base_nonce, test_data, chunk_size).unwrap();
+        assert!(ciphertext.len() > test_data.len());
+        
+        // Decrypt data using chunked decryption
+        let plaintext = decrypt_data_chunked(&algorithm, &key, &base_nonce, &ciphertext, chunk_size).unwrap();
+        assert_eq!(plaintext, test_data);
+    }
+
+    #[test]
+    fn test_chunked_encryption_empty_data() {
+        let algorithm = EncryptionAlgorithm::Aes256Gcm;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        let empty_data = b"";
+        let chunk_size = 1024;
+        
+        // Encrypt empty data using chunked encryption
+        let ciphertext = encrypt_data_chunked(&algorithm, &key, &base_nonce, empty_data, chunk_size).unwrap();
+        assert!(ciphertext.is_empty()); // Empty data should result in empty ciphertext for chunked encryption
+        
+        // Decrypt empty data using chunked decryption
+        let plaintext = decrypt_data_chunked(&algorithm, &key, &base_nonce, &ciphertext, chunk_size).unwrap();
+        assert_eq!(plaintext, empty_data);
+    }
+
+    #[test]
+    fn test_chunked_encryption_single_chunk() {
+        let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        let test_data = b"Small data that fits in one chunk";
+        let chunk_size = 1024; // Much larger than test data
+        
+        // Encrypt data using chunked encryption (should create single chunk)
+        let ciphertext = encrypt_data_chunked(&algorithm, &key, &base_nonce, test_data, chunk_size).unwrap();
+        assert!(ciphertext.len() > test_data.len());
+        
+        // Decrypt data using chunked decryption
+        let plaintext = decrypt_data_chunked(&algorithm, &key, &base_nonce, &ciphertext, chunk_size).unwrap();
+        assert_eq!(plaintext, test_data);
+    }
+
+    #[test]
+    fn test_chunked_encryption_zero_chunk_size_fails() {
+        let algorithm = EncryptionAlgorithm::Aes256Gcm;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        let test_data = b"Test data";
+        let chunk_size = 0; // Invalid chunk size
+        
+        // Should fail with zero chunk size
+        let result = encrypt_data_chunked(&algorithm, &key, &base_nonce, test_data, chunk_size);
+        assert!(result.is_err());
     }
 }

@@ -102,7 +102,9 @@ The `.sec` format is a binary container with the following structure:
 ├─────────────────────────────────────────────────────────────┤
 │ CBOR Header      │ Variable length (self-describing)        │
 ├─────────────────────────────────────────────────────────────┤
-│ Encrypted Data   │ Variable length (algorithm-specific)     │
+│ Encrypted Data   │ Variable length (data-specific)          │
+├─────────────────────────────────────────────────────────────┤
+│ File HMAC        │ 32 bytes (HMAC-SHA256 of plaintext)      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -128,9 +130,57 @@ The header contains all encryption metadata in CBOR format:
   },
   "content_type": "File" | "Directory",   // Content type
   "salt": [32 bytes],                     // Random salt for key derivation
-  "nonce": [12 bytes]                     // Random nonce for AES-GCM
+  "nonce": [8/16 bytes],                  // Base nonce for chunked encryption
+  "chunk_size": 65536                     // Chunk size in bytes (64KB default)
 }
 ```
+
+### Chunked Encryption Format
+
+Data is encrypted in fixed-size chunks for efficient streaming and memory usage. The new format eliminates per-chunk length prefixes by using a consistent chunk size:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Encrypted Data                           │
+├─────────────────────────────────────────────────────────────┤
+│ Chunk 1 Data     │ Fixed size encrypted chunk (chunk_size)  │
+├─────────────────────────────────────────────────────────────┤
+│ Chunk 2 Data     │ Fixed size encrypted chunk (chunk_size)  │
+├─────────────────────────────────────────────────────────────┤
+│ Chunk 3 Data     │ Fixed size encrypted chunk (chunk_size)  │
+├─────────────────────────────────────────────────────────────┤
+│ ...              │ Additional fixed-size chunks             │
+├─────────────────────────────────────────────────────────────┤
+│ Last Chunk       │ Variable size (≤ chunk_size)             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Format Benefits:**
+- **Fixed-Size Chunks**: Each encrypted chunk (except the last) is exactly `chunk_size` bytes
+- **No Length Prefixes**: Eliminates 4-byte length headers, reducing overhead  
+- **Streaming-Friendly**: No need to know total data length upfront - process chunks as they arrive
+- **Natural Termination**: Decryption completes when ciphertext is exhausted
+
+**Chunk Details:**
+- **Plaintext per chunk**: `chunk_size - 16 bytes` (e.g., 64KB chunk = 65520 bytes plaintext + 16 byte auth tag)
+- **Last chunk**: May be smaller than `chunk_size` to accommodate remaining data
+
+Each chunk uses a unique nonce created by combining the base nonce with a chunk counter.
+
+### File Integrity Protection
+
+The `.sec` format provides comprehensive integrity protection through multiple layers:
+
+**Per-Chunk Authentication (AEAD):**
+- Each chunk includes a 16-byte authentication tag
+- Immediate detection of chunk-level corruption or tampering
+- Prevents chosen-ciphertext attacks on individual chunks
+- Enables safe streaming decryption
+
+**File-Level Integrity (HMAC):**
+- 32-byte HMAC-SHA256 appended to the end of the file
+- Computed over the original plaintext data using the encryption key
+- Verified after successful decryption of all chunks
 
 ## Examples
 

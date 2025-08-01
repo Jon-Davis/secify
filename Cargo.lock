@@ -739,10 +739,12 @@ dependencies = [
  "chacha20poly1305",
  "ciborium",
  "clap",
+ "hmac",
  "indicatif",
  "rand",
  "rpassword",
  "serde",
+ "sha2",
  "zip",
 ]
 
