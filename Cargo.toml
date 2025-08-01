@@ -14,3 +14,4 @@ zip = "0.6"
 indicatif = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 ciborium = "0.2"
+rpassword = "7.0"
