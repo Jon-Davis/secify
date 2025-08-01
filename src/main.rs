@@ -7,6 +7,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce
 };
+use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305, Nonce as ChaNonce, XNonce};
 use argon2::{Argon2, Algorithm, Version, Params, PasswordHasher};
 use argon2::password_hash::{rand_core::RngCore, SaltString};
 use clap::Parser;
@@ -18,13 +19,16 @@ use serde::{Serialize, Deserialize};
 
 #[derive(Parser)]
 #[command(name = "secify")]
-#[command(about = "A CLI tool for encrypting and decrypting files and directories using AES-256-GCM with Argon2 key derivation")]
+#[command(about = "A CLI tool for encrypting and decrypting files and directories using industry-standard cryptography (AES-256-GCM, ChaCha20-Poly1305) with Argon2 key derivation")]
 struct Cli {
     /// Input file or directory path (.sec files will be decrypted, others will be encrypted)
     file: Option<String>,
     /// Password for encryption/decryption
     #[arg(short, long)]
     password: Option<String>,
+    /// Encryption algorithm (aes256, chacha20, xchacha20, default: xchacha20)
+    #[arg(short, long, value_parser = parse_algorithm, default_value = "xchacha20")]
+    algorithm: EncryptionAlgorithm,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -75,15 +79,58 @@ enum ContentType {
     Directory,
 }
 
+#[derive(Debug, Clone)]
+enum EncryptionAlgorithm {
+    Aes256Gcm,
+    ChaCha20Poly1305,
+    XChaCha20Poly1305,
+}
+
+impl EncryptionAlgorithm {
+    fn from_string(s: &str) -> Result<Self> {
+        match s {
+            "AES-256-GCM" => Ok(EncryptionAlgorithm::Aes256Gcm),
+            "ChaCha20-Poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
+            "XChaCha20-Poly1305" => Ok(EncryptionAlgorithm::XChaCha20Poly1305),
+            _ => bail!("Unsupported encryption algorithm: {}", s),
+        }
+    }
+    
+    fn to_string(&self) -> &'static str {
+        match self {
+            EncryptionAlgorithm::Aes256Gcm => "AES-256-GCM",
+            EncryptionAlgorithm::ChaCha20Poly1305 => "ChaCha20-Poly1305",
+            EncryptionAlgorithm::XChaCha20Poly1305 => "XChaCha20-Poly1305",
+        }
+    }
+    
+    fn nonce_length(&self) -> usize {
+        match self {
+            EncryptionAlgorithm::Aes256Gcm => 12,  // AES-GCM uses 96-bit nonces
+            EncryptionAlgorithm::ChaCha20Poly1305 => 12,  // ChaCha20-Poly1305 uses 96-bit nonces
+            EncryptionAlgorithm::XChaCha20Poly1305 => 24,  // XChaCha20-Poly1305 uses 192-bit nonces
+        }
+    }
+}
+
+fn parse_algorithm(s: &str) -> Result<EncryptionAlgorithm, String> {
+    match s.to_lowercase().as_str() {
+        "aes256" | "aes" | "aes-256-gcm" => Ok(EncryptionAlgorithm::Aes256Gcm),
+        "chacha20" | "chacha" | "chacha20-poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
+        "xchacha20" | "xchacha" | "xchacha20-poly1305" => Ok(EncryptionAlgorithm::XChaCha20Poly1305),
+        _ => Err(format!("Invalid algorithm '{}'. Valid options: aes256, chacha20, xchacha20", s)),
+    }
+}
+
 const SALT_LENGTH: usize = 32;
-const NONCE_LENGTH: usize = 12;
 const KEY_LENGTH: usize = 32;
 const FILE_FORMAT_VERSION: u32 = 1;
+const DEFAULT_ALGORITHM: EncryptionAlgorithm = EncryptionAlgorithm::XChaCha20Poly1305;
 
-fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool) -> EncryptionHeader {
+fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool, algorithm: &EncryptionAlgorithm) -> EncryptionHeader {
     EncryptionHeader {
         version: FILE_FORMAT_VERSION,
-        encryption_algorithm: "AES-256-GCM".to_string(),
+        encryption_algorithm: algorithm.to_string().to_string(),
         kdf: KeyDerivationConfig {
             algorithm: "Argon2id".to_string(),
             version: "0x13".to_string(),
@@ -122,10 +169,8 @@ fn validate_header(header: &EncryptionHeader) -> Result<()> {
               header.version, FILE_FORMAT_VERSION);
     }
     
-    // Validate encryption algorithm
-    if header.encryption_algorithm != "AES-256-GCM" {
-        bail!("Unsupported encryption algorithm: {}", header.encryption_algorithm);
-    }
+    // Validate encryption algorithm (parse to ensure it's supported)
+    let algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
     
     // Validate KDF
     if header.kdf.algorithm != "Argon2id" {
@@ -137,8 +182,10 @@ fn validate_header(header: &EncryptionHeader) -> Result<()> {
         bail!("Invalid salt length: expected {}, got {}", SALT_LENGTH, header.salt.len());
     }
     
-    if header.nonce.len() != NONCE_LENGTH {
-        bail!("Invalid nonce length: expected {}, got {}", NONCE_LENGTH, header.nonce.len());
+    let expected_nonce_length = algorithm.nonce_length();
+    if header.nonce.len() != expected_nonce_length {
+        bail!("Invalid nonce length for {}: expected {}, got {}", 
+              algorithm.to_string(), expected_nonce_length, header.nonce.len());
     }
     
     Ok(())
@@ -178,6 +225,58 @@ fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LENGTH]> {
     let mut key = [0u8; KEY_LENGTH];
     key.copy_from_slice(&hash_bytes[..KEY_LENGTH]);
     Ok(key)
+}
+
+fn encrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], nonce: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    match algorithm {
+        EncryptionAlgorithm::Aes256Gcm => {
+            let cipher = Aes256Gcm::new_from_slice(key)
+                .map_err(|e| anyhow::anyhow!("Failed to create AES cipher: {}", e))?;
+            let nonce = Nonce::from_slice(nonce);
+            cipher.encrypt(nonce, data)
+                .map_err(|e| anyhow::anyhow!("Failed to encrypt with AES-256-GCM: {}", e))
+        }
+        EncryptionAlgorithm::ChaCha20Poly1305 => {
+            let cipher = ChaCha20Poly1305::new_from_slice(key)
+                .map_err(|e| anyhow::anyhow!("Failed to create ChaCha20 cipher: {}", e))?;
+            let nonce = ChaNonce::from_slice(nonce);
+            cipher.encrypt(nonce, data)
+                .map_err(|e| anyhow::anyhow!("Failed to encrypt with ChaCha20-Poly1305: {}", e))
+        }
+        EncryptionAlgorithm::XChaCha20Poly1305 => {
+            let cipher = XChaCha20Poly1305::new_from_slice(key)
+                .map_err(|e| anyhow::anyhow!("Failed to create XChaCha20 cipher: {}", e))?;
+            let nonce = XNonce::from_slice(nonce);
+            cipher.encrypt(nonce, data)
+                .map_err(|e| anyhow::anyhow!("Failed to encrypt with XChaCha20-Poly1305: {}", e))
+        }
+    }
+}
+
+fn decrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    match algorithm {
+        EncryptionAlgorithm::Aes256Gcm => {
+            let cipher = Aes256Gcm::new_from_slice(key)
+                .map_err(|e| anyhow::anyhow!("Failed to create AES cipher: {}", e))?;
+            let nonce = Nonce::from_slice(nonce);
+            cipher.decrypt(nonce, ciphertext)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt with AES-256-GCM - incorrect password or corrupted file: {}", e))
+        }
+        EncryptionAlgorithm::ChaCha20Poly1305 => {
+            let cipher = ChaCha20Poly1305::new_from_slice(key)
+                .map_err(|e| anyhow::anyhow!("Failed to create ChaCha20 cipher: {}", e))?;
+            let nonce = ChaNonce::from_slice(nonce);
+            cipher.decrypt(nonce, ciphertext)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt with ChaCha20-Poly1305 - incorrect password or corrupted file: {}", e))
+        }
+        EncryptionAlgorithm::XChaCha20Poly1305 => {
+            let cipher = XChaCha20Poly1305::new_from_slice(key)
+                .map_err(|e| anyhow::anyhow!("Failed to create XChaCha20 cipher: {}", e))?;
+            let nonce = XNonce::from_slice(nonce);
+            cipher.decrypt(nonce, ciphertext)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt with XChaCha20-Poly1305 - incorrect password or corrupted file: {}", e))
+        }
+    }
 }
 
 fn count_files_in_directory(dir_path: &Path) -> Result<u64> {
@@ -336,23 +435,18 @@ fn unzip_to_directory(zip_data: &[u8], output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn encrypt_file(file_path: &str, password: &str) -> Result<()> {
+fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgorithm) -> Result<()> {
     let path = Path::new(file_path);
     
     // Generate random salt and nonce first
     let mut salt = [0u8; SALT_LENGTH];
-    let mut nonce_bytes = [0u8; NONCE_LENGTH];
+    let nonce_length = algorithm.nonce_length();
+    let mut nonce_bytes = vec![0u8; nonce_length];
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce_bytes);
     
     // Derive encryption key from password and salt (this is the slow step)
     let key = derive_key(password, &salt)?;
-    
-    // Create cipher
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
-    
-    let nonce = Nonce::from_slice(&nonce_bytes);
     
     // Now do the progress-tracked operations
     // Determine what we're encrypting
@@ -369,11 +463,10 @@ fn encrypt_file(file_path: &str, password: &str) -> Result<()> {
     
     // Encrypt the data
     println!("Encrypting data...");
-    let ciphertext = cipher.encrypt(nonce, input_data.as_ref())
-        .map_err(|e| anyhow::anyhow!("Failed to encrypt data: {}", e))?;
+    let ciphertext = encrypt_data(&algorithm, &key, &nonce_bytes, &input_data)?;
     
     // Create CBOR header with encryption details
-    let header = create_encryption_header(&salt, &nonce_bytes, is_directory);
+    let header = create_encryption_header(&salt, &nonce_bytes, is_directory, &algorithm);
     let cbor_header = serialize_header_to_cbor(&header)?;
     
     // Create output file structure: 
@@ -465,14 +558,11 @@ fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
     
     let is_directory = matches!(header.content_type, ContentType::Directory);
     
+    // Parse the encryption algorithm from header
+    let algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
+    
     // Derive decryption key from password and salt from header
     let key = derive_key(password, &header.salt)?;
-    
-    // Create cipher
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
-    
-    let nonce = Nonce::from_slice(&header.nonce);
     
     // Decrypt the data
     println!("Decrypting data...");
@@ -484,8 +574,7 @@ fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
             .progress_chars("#>-"),
     );
     
-    let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("Failed to decrypt data - incorrect password or corrupted file: {}", e))?;
+    let plaintext = decrypt_data(&algorithm, &key, &header.nonce, ciphertext)?;
     
     decrypt_pb.inc(ciphertext.len() as u64);
     decrypt_pb.finish_with_message("Decryption complete");
@@ -628,6 +717,26 @@ fn interactive_mode() -> Result<()> {
         println!("Detected non-.sec file - will encrypt");
     }
     
+    // Get encryption algorithm (only for encryption)
+    let algorithm = if is_decrypt {
+        DEFAULT_ALGORITHM // Will be read from file header
+    } else {
+        println!("\nSelect encryption algorithm:");
+        println!("1. AES-256-GCM (hardware accelerated on most CPUs, 96-bit nonce)");
+        println!("2. ChaCha20-Poly1305 (faster on mobile/older CPUs, 96-bit nonce)");
+        println!("3. XChaCha20-Poly1305 (default, recommended for high-volume use, 192-bit nonce)");
+        
+        loop {
+            let choice = prompt_user("Enter choice (1, 2, or 3, default is 3): ")?;
+            match choice.trim() {
+                "1" => break EncryptionAlgorithm::Aes256Gcm,
+                "2" => break EncryptionAlgorithm::ChaCha20Poly1305,
+                "" | "3" => break EncryptionAlgorithm::XChaCha20Poly1305,
+                _ => println!("Invalid choice. Please enter 1, 2, or 3."),
+            }
+        }
+    };
+    
     // Get password
     let password = loop {
         let pass = get_password(&format!("Enter password for {}: ", if is_decrypt { "decryption" } else { "encryption" }))?;
@@ -657,7 +766,7 @@ fn interactive_mode() -> Result<()> {
         decrypt_file(&file_path, &password)?;
     } else {
         println!("\nEncrypting file...");
-        encrypt_file(&file_path, &password)?;
+        encrypt_file(&file_path, &password, &algorithm)?;
     }
     
     Ok(())
@@ -679,7 +788,8 @@ fn main() -> Result<()> {
                 decrypt_file(&file, &password)?;
             } else {
                 println!("Detected non-.sec file - encrypting...");
-                encrypt_file(&file, &password)?;
+                println!("Using encryption algorithm: {}", cli.algorithm.to_string());
+                encrypt_file(&file, &password, &cli.algorithm)?;
             }
         },
         _ => {
