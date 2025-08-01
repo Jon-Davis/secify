@@ -38,11 +38,17 @@ Follow the prompts to:
 
 ### Command Line Mode
 ```bash
-# Encrypt a file with default algorithm (XChaCha20-Poly1305)
+# Encrypt a file with default settings (XChaCha20-Poly1305, 128MB memory, 8 iterations, 4 threads)
 secify document.pdf
 
 # Encrypt with specific algorithm
 secify -a aes256 document.pdf
+
+# Encrypt with custom Argon2 parameters for higher security
+secify --memory-mb 256 --time-cost 12 --parallelism 8 document.pdf
+
+# Encrypt with faster Argon2 parameters for performance
+secify --memory-mb 64 --time-cost 4 --parallelism 2 document.pdf
 
 # Encrypt a directory
 secify /path/to/folder
@@ -59,8 +65,26 @@ secify -p mypassword document.pdf
 - **AES-256-GCM**: Hardware accelerated on most modern CPUs
 - **ChaCha20-Poly1305**: Faster on mobile and older processors
 
-### Key Derivation
-- **Argon2id**: Winner of the Password Hashing Competition
+### Argon2id Key Derivation
+Secify uses Argon2id for key derivation with customizable parameters:
+
+- **Memory Cost** (8-2048 MB, default: 128): Memory usage during key derivation
+  - Higher = more secure against GPU attacks, but slower and uses more RAM
+  - Recommended: 128MB for normal use, 256-512MB for high security
+
+- **Time Cost** (1-100 iterations, default: 8): Number of iterations
+  - Higher = more secure against brute force, but slower
+  - Recommended: 8 for normal use, 12-16 for high security
+
+- **Parallelism** (1-16 threads, default: 4): Number of parallel threads
+  - Should match your CPU cores for best performance
+  - Higher doesn't necessarily mean more secure
+
+**Examples:**
+- **Fast/Mobile**: `--memory-mb 32 --time-cost 4 --parallelism 2`
+- **Balanced**: `--memory-mb 128 --time-cost 8 --parallelism 4` (default)
+- **High Security**: `--memory-mb 512 --time-cost 16 --parallelism 8`
+- **Server/Batch**: `--memory-mb 1024 --time-cost 12 --parallelism 16`
 
 ## File Format: Securely Encrypted Container (.sec)
 
@@ -115,9 +139,38 @@ $ secify document.pdf
 
 Enter file or directory path: document.pdf
 Detected non-.sec file - encrypting...
-Enter password: [hidden input]
+
+Select encryption algorithm:
+1. AES-256-GCM (hardware accelerated on most CPUs, 96-bit nonce)
+2. ChaCha20-Poly1305 (faster on mobile/older CPUs, 96-bit nonce)
+3. XChaCha20-Poly1305 (default, recommended for high-volume use, 192-bit nonce)
+Enter choice (1, 2, or 3, default is 3): 
+
+Argon2id Key Derivation Settings:
+Current: 128MB memory, 8 iterations, 4 threads
+Customize Argon2 parameters? (y/N): y
+Memory cost in MB (8-2048, current: 128): 256
+Time cost/iterations (1-100, current: 8): 12
+Parallelism/threads (1-16, current: 4): 8
+Final Argon2id settings: 256MB memory, 12 iterations, 8 threads
+
+Enter password for encryption: [hidden input]
+Confirm password: [hidden input]
 [████████████████████] 100% - Encryption complete
 File encrypted successfully: document.pdf.sec
+```
+
+### Command Line with Custom Argon2
+```bash
+$ secify --memory-mb 512 --time-cost 16 --parallelism 8 -a aes256 sensitive_data.pdf
+Detected non-.sec file - encrypting...
+Using encryption algorithm: AES-256-GCM
+Using Argon2id parameters: 512MB memory, 16 iterations, 8 threads
+Enter password for encryption: [hidden input]
+Deriving encryption key with Argon2id (512MB, 16 iterations, 8 threads)...
+Argon2 key derivation completed in 4.23 seconds
+[████████████████████] 100% - Encryption complete
+File encrypted successfully: sensitive_data.pdf.sec
 ```
 
 ### Decrypting a Container

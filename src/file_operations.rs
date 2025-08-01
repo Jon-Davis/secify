@@ -173,7 +173,7 @@ pub fn unzip_to_directory(zip_data: &[u8], output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgorithm) -> Result<()> {
+pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params) -> Result<()> {
     let path = Path::new(file_path);
     
     // Validate file/directory exists and check size for files
@@ -195,7 +195,7 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
     generate_secure_random_bytes(&mut nonce_bytes)?;
     
     // Derive encryption key from password and salt (this is the slow step)
-    let key = derive_key(password, &salt)?;
+    let key = derive_key(password, &salt, &argon2_params)?;
     
     // Now do the progress-tracked operations
     // Determine what we're encrypting
@@ -215,7 +215,7 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
     let ciphertext = encrypt_data(&algorithm, &key, &nonce_bytes, &input_data)?;
     
     // Create CBOR header with encryption details
-    let header = create_encryption_header(&salt, &nonce_bytes, is_directory, &algorithm);
+    let header = create_encryption_header(&salt, &nonce_bytes, is_directory, &algorithm, &argon2_params);
     let cbor_header = serialize_header_to_cbor(&header)?;
     
     // Create output file structure: 
@@ -311,8 +311,15 @@ pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
     // Parse the encryption algorithm from header
     let algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
     
+    // Extract Argon2 parameters from header
+    let argon2_params = Argon2Params::new(
+        header.kdf.memory_cost / 1024, // Convert KB back to MB
+        header.kdf.time_cost,
+        header.kdf.parallelism,
+    )?;
+    
     // Derive decryption key from password and salt from header
-    let key = derive_key(password, &header.salt)?;
+    let key = derive_key(password, &header.salt, &argon2_params)?;
     
     // Decrypt the data
     println!("Decrypting data...");

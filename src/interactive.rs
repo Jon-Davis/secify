@@ -3,7 +3,7 @@ use std::path::Path;
 use std::io::{self, Write};
 use anyhow::{Result, Context, bail};
 
-use crate::crypto::EncryptionAlgorithm;
+use crate::crypto::{EncryptionAlgorithm, Argon2Params};
 use crate::cli::{DEFAULT_ALGORITHM, MIN_PASSWORD_LENGTH};
 use crate::file_operations::{encrypt_file, decrypt_file};
 
@@ -72,6 +72,11 @@ pub fn list_current_directory() -> Result<()> {
 }
 
 pub fn interactive_mode() -> Result<()> {
+    let default_params = Argon2Params::default();
+    interactive_mode_with_params(default_params)
+}
+
+pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<()> {
     println!("=== Secify Interactive Mode ===\n");
     
     // Get file path
@@ -120,6 +125,79 @@ pub fn interactive_mode() -> Result<()> {
             }
         }
     };
+
+    // Get Argon2 parameters (only for encryption)
+    if !is_decrypt {
+        println!("\nArgon2id Key Derivation Settings:");
+        println!("Current: {}MB memory, {} iterations, {} threads", 
+                 argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
+        
+        let customize = prompt_user("Customize Argon2 parameters? (y/N): ")?;
+        if customize.to_lowercase() == "y" || customize.to_lowercase() == "yes" {
+            // Memory cost
+            loop {
+                let input = prompt_user(&format!("Memory cost in MB (8-2048, current: {}): ", argon2_params.memory_mb))?;
+                if input.is_empty() {
+                    break; // Keep current value
+                }
+                match input.parse::<u32>() {
+                    Ok(memory_mb) => {
+                        match Argon2Params::new(memory_mb, argon2_params.time_cost, argon2_params.parallelism) {
+                            Ok(new_params) => {
+                                argon2_params = new_params;
+                                break;
+                            }
+                            Err(e) => println!("Invalid memory cost: {}", e),
+                        }
+                    }
+                    Err(_) => println!("Invalid number. Please enter a value between 8 and 2048."),
+                }
+            }
+            
+            // Time cost
+            loop {
+                let input = prompt_user(&format!("Time cost/iterations (1-100, current: {}): ", argon2_params.time_cost))?;
+                if input.is_empty() {
+                    break; // Keep current value
+                }
+                match input.parse::<u32>() {
+                    Ok(time_cost) => {
+                        match Argon2Params::new(argon2_params.memory_mb, time_cost, argon2_params.parallelism) {
+                            Ok(new_params) => {
+                                argon2_params = new_params;
+                                break;
+                            }
+                            Err(e) => println!("Invalid time cost: {}", e),
+                        }
+                    }
+                    Err(_) => println!("Invalid number. Please enter a value between 1 and 100."),
+                }
+            }
+            
+            // Parallelism
+            loop {
+                let input = prompt_user(&format!("Parallelism/threads (1-16, current: {}): ", argon2_params.parallelism))?;
+                if input.is_empty() {
+                    break; // Keep current value
+                }
+                match input.parse::<u32>() {
+                    Ok(parallelism) => {
+                        match Argon2Params::new(argon2_params.memory_mb, argon2_params.time_cost, parallelism) {
+                            Ok(new_params) => {
+                                argon2_params = new_params;
+                                break;
+                            }
+                            Err(e) => println!("Invalid parallelism: {}", e),
+                        }
+                    }
+                    Err(_) => println!("Invalid number. Please enter a value between 1 and 16."),
+                }
+            }
+            
+            println!("Final Argon2id settings: {}MB memory, {} iterations, {} threads", 
+                     argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
+        }
+    }
     
     // Get password
     let password = loop {
@@ -163,7 +241,7 @@ pub fn interactive_mode() -> Result<()> {
         decrypt_file(&file_path, &password)?;
     } else {
         println!("\nEncrypting file...");
-        encrypt_file(&file_path, &password, &algorithm)?;
+        encrypt_file(&file_path, &password, &algorithm, &argon2_params)?;
     }
     
     Ok(())

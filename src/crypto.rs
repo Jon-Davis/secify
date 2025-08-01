@@ -15,6 +15,62 @@ pub const KEY_LENGTH: usize = 32;
 pub const FILE_FORMAT_VERSION: u32 = 1;
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB limit to prevent OOM
 
+// Default Argon2 parameters
+pub const DEFAULT_MEMORY_MB: u32 = 128;
+pub const DEFAULT_TIME_COST: u32 = 8;
+pub const DEFAULT_PARALLELISM: u32 = 4;
+
+#[derive(Debug, Clone)]
+pub struct Argon2Params {
+    pub memory_mb: u32,
+    pub time_cost: u32,
+    pub parallelism: u32,
+}
+
+impl Default for Argon2Params {
+    fn default() -> Self {
+        Self {
+            memory_mb: DEFAULT_MEMORY_MB,
+            time_cost: DEFAULT_TIME_COST,
+            parallelism: DEFAULT_PARALLELISM,
+        }
+    }
+}
+
+impl Argon2Params {
+    pub fn new(memory_mb: u32, time_cost: u32, parallelism: u32) -> Result<Self> {
+        // Validate parameters
+        if memory_mb < 8 {
+            bail!("Memory cost must be at least 8 MB");
+        }
+        if memory_mb > 2048 {
+            bail!("Memory cost cannot exceed 2048 MB (2GB)");
+        }
+        if time_cost < 1 {
+            bail!("Time cost must be at least 1 iteration");
+        }
+        if time_cost > 100 {
+            bail!("Time cost cannot exceed 100 iterations");
+        }
+        if parallelism < 1 {
+            bail!("Parallelism must be at least 1 thread");
+        }
+        if parallelism > 16 {
+            bail!("Parallelism cannot exceed 16 threads");
+        }
+        
+        Ok(Self {
+            memory_mb,
+            time_cost,
+            parallelism,
+        })
+    }
+    
+    pub fn memory_kb(&self) -> u32 {
+        self.memory_mb * 1024
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EncryptionAlgorithm {
     Aes256Gcm,
@@ -119,12 +175,12 @@ pub fn generate_secure_random_bytes(buffer: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LENGTH]> {
+pub fn derive_key(password: &str, salt: &[u8], argon2_params: &Argon2Params) -> Result<[u8; KEY_LENGTH]> {
     // Explicit Argon2id parameters for security and transparency
     let params = Params::new(
-        131072, // memory cost: 128 MB
-        8,     // time cost: 8 iterations
-        4,     // parallelism: 4 threads
+        argon2_params.memory_kb(), // memory cost in KB
+        argon2_params.time_cost,   // time cost: iterations
+        argon2_params.parallelism, // parallelism: threads
         Some(KEY_LENGTH) // output length: 32 bytes
     ).map_err(|e| anyhow::anyhow!("Failed to create Argon2 params: {}", e))?;
     
@@ -132,7 +188,8 @@ pub fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LENGTH]> {
     let salt_string = SaltString::encode_b64(salt)
         .map_err(|e| anyhow::anyhow!("Failed to encode salt: {}", e))?;
     
-    println!("Deriving encryption key with Argon2id (128MB, 8 iterations, 4 threads)...");
+    println!("Deriving encryption key with Argon2id ({}MB, {} iterations, {} threads)...", 
+             argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
     let start_time = Instant::now();
     
     let password_hash = argon2
@@ -207,16 +264,16 @@ pub fn decrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], non
     }
 }
 
-pub fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool, algorithm: &EncryptionAlgorithm) -> EncryptionHeader {
+pub fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool, algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params) -> EncryptionHeader {
     EncryptionHeader {
         version: FILE_FORMAT_VERSION,
         encryption_algorithm: algorithm.to_string().to_owned(),
         kdf: KeyDerivationConfig {
             algorithm: "Argon2id".to_owned(),
             version: "0x13".to_owned(),
-            memory_cost: 131072, // 128 MB in KB
-            time_cost: 8,
-            parallelism: 4,
+            memory_cost: argon2_params.memory_kb(),
+            time_cost: argon2_params.time_cost,
+            parallelism: argon2_params.parallelism,
             output_length: KEY_LENGTH as u32,
         },
         compression: CompressionConfig {
@@ -359,19 +416,20 @@ mod tests {
     #[test]
     fn test_derive_key_consistency() {
         let salt = create_test_salt();
+        let params = Argon2Params::default();
         
         // Same password and salt should produce same key
-        let key1 = derive_key(TEST_PASSWORD, &salt).unwrap();
-        let key2 = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let key1 = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        let key2 = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         assert_eq!(key1, key2);
         
         // Different password should produce different key
-        let key3 = derive_key("DifferentPassword", &salt).unwrap();
+        let key3 = derive_key("DifferentPassword", &salt, &params).unwrap();
         assert_ne!(key1, key3);
         
         // Different salt should produce different key
         let different_salt = [2u8; SALT_LENGTH];
-        let key4 = derive_key(TEST_PASSWORD, &different_salt).unwrap();
+        let key4 = derive_key(TEST_PASSWORD, &different_salt, &params).unwrap();
         assert_ne!(key1, key4);
     }
 
@@ -380,7 +438,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let key = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let params = Argon2Params::default();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt data
         let ciphertext = encrypt_data(&algorithm, &key, &nonce, TEST_DATA).unwrap();
@@ -397,7 +456,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let key = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let params = Argon2Params::default();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt data
         let ciphertext = encrypt_data(&algorithm, &key, &nonce, TEST_DATA).unwrap();
@@ -414,7 +474,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let key = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let params = Argon2Params::default();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt data
         let ciphertext = encrypt_data(&algorithm, &key, &nonce, TEST_DATA).unwrap();
@@ -431,13 +492,14 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let key = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let params = Argon2Params::default();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt with correct key
         let ciphertext = encrypt_data(&algorithm, &key, &nonce, TEST_DATA).unwrap();
         
         // Try to decrypt with wrong key
-        let wrong_key = derive_key("WrongPassword", &salt).unwrap();
+        let wrong_key = derive_key("WrongPassword", &salt, &params).unwrap();
         let result = decrypt_data(&algorithm, &wrong_key, &nonce, &ciphertext);
         assert!(result.is_err());
     }
@@ -447,7 +509,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let key = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let params = Argon2Params::default();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt with correct nonce
         let ciphertext = encrypt_data(&algorithm, &key, &nonce, TEST_DATA).unwrap();
@@ -463,22 +526,23 @@ mod tests {
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
+        let params = Argon2Params::default();
         
         // Test file header
-        let header = create_encryption_header(&salt, &nonce, false, &algorithm);
+        let header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
         assert_eq!(header.version, FILE_FORMAT_VERSION);
         assert_eq!(header.encryption_algorithm, "XChaCha20-Poly1305");
         assert_eq!(header.kdf.algorithm, "Argon2id");
-        assert_eq!(header.kdf.memory_cost, 131072);
-        assert_eq!(header.kdf.time_cost, 8);
-        assert_eq!(header.kdf.parallelism, 4);
+        assert_eq!(header.kdf.memory_cost, params.memory_kb());
+        assert_eq!(header.kdf.time_cost, params.time_cost);
+        assert_eq!(header.kdf.parallelism, params.parallelism);
         assert_eq!(header.compression.enabled, false);
         assert!(matches!(header.content_type, ContentType::File));
         assert_eq!(header.salt, salt.to_vec());
         assert_eq!(header.nonce, nonce);
         
         // Test directory header
-        let dir_header = create_encryption_header(&salt, &nonce, true, &algorithm);
+        let dir_header = create_encryption_header(&salt, &nonce, true, &algorithm, &params);
         assert_eq!(dir_header.compression.enabled, true);
         assert!(matches!(dir_header.content_type, ContentType::Directory));
     }
@@ -488,7 +552,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let original_header = create_encryption_header(&salt, &nonce, true, &algorithm);
+        let params = Argon2Params::default();
+        let original_header = create_encryption_header(&salt, &nonce, true, &algorithm, &params);
         
         // Serialize to CBOR
         let cbor_data = serialize_header_to_cbor(&original_header).unwrap();
@@ -511,7 +576,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let header = create_encryption_header(&salt, &nonce, false, &algorithm);
+        let params = Argon2Params::default();
+        let header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
         
         // Valid header should pass validation
         assert!(validate_header(&header).is_ok());
@@ -522,7 +588,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm);
+        let params = Argon2Params::default();
+        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
         
         // Set invalid version
         header.version = FILE_FORMAT_VERSION + 1;
@@ -534,7 +601,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm);
+        let params = Argon2Params::default();
+        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
         
         // Set invalid algorithm
         header.encryption_algorithm = "Invalid-Algorithm".to_string();
@@ -546,7 +614,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm);
+        let params = Argon2Params::default();
+        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
         
         // Set invalid KDF
         header.kdf.algorithm = "PBKDF2".to_string();
@@ -558,7 +627,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm);
+        let params = Argon2Params::default();
+        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
         
         // Set invalid salt length
         header.salt = vec![1u8; 16]; // Wrong length
@@ -570,7 +640,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm);
+        let params = Argon2Params::default();
+        let mut header = create_encryption_header(&salt, &nonce, false, &algorithm, &params);
         
         // Set invalid nonce length
         header.nonce = vec![2u8; 8]; // Wrong length for AES-GCM
@@ -580,7 +651,8 @@ mod tests {
     #[test]
     fn test_encryption_algorithms_are_not_interchangeable() {
         let salt = create_test_salt();
-        let key = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let params = Argon2Params::default();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Encrypt with AES-256-GCM
         let aes_algorithm = EncryptionAlgorithm::Aes256Gcm;
@@ -599,7 +671,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let key = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let params = Argon2Params::default();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         let empty_data = b"";
         
@@ -617,7 +690,8 @@ mod tests {
         let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
         let salt = create_test_salt();
         let nonce = create_test_nonce(&algorithm);
-        let key = derive_key(TEST_PASSWORD, &salt).unwrap();
+        let params = Argon2Params::default();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
         
         // Create 1MB of test data
         let large_data = vec![0x42u8; 1024 * 1024];
