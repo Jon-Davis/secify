@@ -1,6 +1,12 @@
 # Secify
 
-A modern CLI tool for encrypting and decrypting files and directories using industry-standard cryptography. Secify creates `.sec` files (Securely Encrypted Container) with a CBOR-based header format that supports multiple encryption algorithms and extensible metadata.
+**Secify** is a secure file encryption program. It transforms any file or folder into an encrypted `.sec` container that can only be opened with the correct password.
+
+## Key Features
+
+- **Multiple Encryption Algorithms**: AES-256-GCM, ChaCha20-Poly1305, and XChaCha20-Poly1305
+- **Directory Support**: Encrypts entire folders while preserving structure
+- **Future-Proof**: Extensible CBOR header format for algorithm upgrades
 
 ## Installation
 
@@ -15,21 +21,28 @@ The binary will be available at `target/release/secify.exe` (Windows) or `target
 
 ## Usage
 
+Secify automatically detects whether to encrypt or decrypt based on the file extension:
+- **Regular files/folders** → Encrypt to `.sec` format
+- **`.sec` files** → Decrypt to original format
+
 ### Interactive Mode (Recommended)
 ```bash
 secify
 ```
 
-Secify will automatically:
-1. Prompt for the file/directory path
-2. Detect if it's a `.sec` file (decrypt) or regular file/directory (encrypt)
-3. Prompt for password
-4. Perform the appropriate operation
+Follow the prompts to:
+1. Select your file or directory
+2. Choose encryption algorithm (for new encryptions)
+3. Enter a secure password
+4. Watch the progress as your data is protected
 
 ### Command Line Mode
 ```bash
-# Encrypt a file
+# Encrypt a file with default algorithm (XChaCha20-Poly1305)
 secify document.pdf
+
+# Encrypt with specific algorithm
+secify -a aes256 document.pdf
 
 # Encrypt a directory
 secify /path/to/folder
@@ -37,9 +50,17 @@ secify /path/to/folder
 # Decrypt a .sec file
 secify document.pdf.sec
 
-# With password 
+# Provide password via command line (less secure)
 secify -p mypassword document.pdf
 ```
+
+### Algorithm Selection
+- **XChaCha20-Poly1305** (default): 192-bit nonce prevents collisions
+- **AES-256-GCM**: Hardware accelerated on most modern CPUs
+- **ChaCha20-Poly1305**: Faster on mobile and older processors
+
+### Key Derivation
+- **Argon2id**: Winner of the Password Hashing Competition
 
 ## File Format: Securely Encrypted Container (.sec)
 
