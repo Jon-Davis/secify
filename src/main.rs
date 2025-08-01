@@ -14,21 +14,135 @@ use anyhow::{Result, Context, bail};
 use zip::{ZipWriter, ZipArchive, write::FileOptions, CompressionMethod};
 use std::io::Cursor;
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Serialize, Deserialize};
 
 #[derive(Parser)]
 #[command(name = "aesify")]
 #[command(about = "A CLI tool for encrypting and decrypting files and directories using AES-256-GCM with Argon2 key derivation")]
 struct Cli {
-    /// Input file or directory path (.aes files will be decrypted, others will be encrypted)
+    /// Input file or directory path (.sec files will be decrypted, others will be encrypted)
     file: Option<String>,
     /// Password for encryption/decryption
     #[arg(short, long)]
     password: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct EncryptionHeader {
+    /// File format version for future compatibility
+    version: u32,
+    /// Encryption algorithm identifier
+    encryption_algorithm: String,
+    /// Key derivation function details
+    kdf: KeyDerivationConfig,
+    /// Compression details
+    compression: CompressionConfig,
+    /// Content type (file or directory)
+    content_type: ContentType,
+    /// Salt for key derivation
+    salt: Vec<u8>,
+    /// Nonce/IV for encryption
+    nonce: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct KeyDerivationConfig {
+    /// Algorithm name (e.g., "Argon2id")
+    algorithm: String,
+    /// Version of the algorithm
+    version: String,
+    /// Memory cost in KB
+    memory_cost: u32,
+    /// Time cost (iterations)
+    time_cost: u32,
+    /// Parallelism (number of threads)
+    parallelism: u32,
+    /// Output length in bytes
+    output_length: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CompressionConfig {
+    /// Compression method used
+    method: String,
+    /// Whether compression was applied
+    enabled: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum ContentType {
+    File,
+    Directory,
+}
+
 const SALT_LENGTH: usize = 32;
 const NONCE_LENGTH: usize = 12;
 const KEY_LENGTH: usize = 32;
+const FILE_FORMAT_VERSION: u32 = 1;
+
+fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool) -> EncryptionHeader {
+    EncryptionHeader {
+        version: FILE_FORMAT_VERSION,
+        encryption_algorithm: "AES-256-GCM".to_string(),
+        kdf: KeyDerivationConfig {
+            algorithm: "Argon2id".to_string(),
+            version: "0x13".to_string(),
+            memory_cost: 131072, // 128 MB in KB
+            time_cost: 8,
+            parallelism: 4,
+            output_length: KEY_LENGTH as u32,
+        },
+        compression: CompressionConfig {
+            method: "ZIP-Stored".to_string(),
+            enabled: is_directory,
+        },
+        content_type: if is_directory { ContentType::Directory } else { ContentType::File },
+        salt: salt.to_vec(),
+        nonce: nonce.to_vec(),
+    }
+}
+
+fn serialize_header_to_cbor(header: &EncryptionHeader) -> Result<Vec<u8>> {
+    let mut cbor_data = Vec::new();
+    ciborium::ser::into_writer(header, &mut cbor_data)
+        .context("Failed to serialize header to CBOR")?;
+    Ok(cbor_data)
+}
+
+fn deserialize_header_from_cbor(cbor_data: &[u8]) -> Result<EncryptionHeader> {
+    let header: EncryptionHeader = ciborium::de::from_reader(cbor_data)
+        .context("Failed to deserialize header from CBOR")?;
+    Ok(header)
+}
+
+fn validate_header(header: &EncryptionHeader) -> Result<()> {
+    // Check version compatibility
+    if header.version > FILE_FORMAT_VERSION {
+        bail!("Unsupported file format version: {}. This tool supports up to version {}.", 
+              header.version, FILE_FORMAT_VERSION);
+    }
+    
+    // Validate encryption algorithm
+    if header.encryption_algorithm != "AES-256-GCM" {
+        bail!("Unsupported encryption algorithm: {}", header.encryption_algorithm);
+    }
+    
+    // Validate KDF
+    if header.kdf.algorithm != "Argon2id" {
+        bail!("Unsupported key derivation function: {}", header.kdf.algorithm);
+    }
+    
+    // Validate salt and nonce lengths
+    if header.salt.len() != SALT_LENGTH {
+        bail!("Invalid salt length: expected {}, got {}", SALT_LENGTH, header.salt.len());
+    }
+    
+    if header.nonce.len() != NONCE_LENGTH {
+        bail!("Invalid nonce length: expected {}, got {}", NONCE_LENGTH, header.nonce.len());
+    }
+    
+    Ok(())
+}
 
 fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LENGTH]> {
     // Explicit Argon2id parameters for security and transparency
@@ -258,21 +372,23 @@ fn encrypt_file(file_path: &str, password: &str) -> Result<()> {
     let ciphertext = cipher.encrypt(nonce, input_data.as_ref())
         .map_err(|e| anyhow::anyhow!("Failed to encrypt data: {}", e))?;
     
+    // Create CBOR header with encryption details
+    let header = create_encryption_header(&salt, &nonce_bytes, is_directory);
+    let cbor_header = serialize_header_to_cbor(&header)?;
+    
     // Create output file structure: 
-    // 1 byte: directory flag (1 for directory, 0 for file)
-    // 32 bytes: salt
-    // 12 bytes: nonce
+    // 4 bytes: CBOR header length (little-endian u32)
+    // N bytes: CBOR header
     // remaining: ciphertext
     let mut output_data = Vec::new();
-    output_data.push(if is_directory { 1u8 } else { 0u8 });
-    output_data.extend_from_slice(&salt);
-    output_data.extend_from_slice(&nonce_bytes);
+    output_data.extend_from_slice(&(cbor_header.len() as u32).to_le_bytes());
+    output_data.extend_from_slice(&cbor_header);
     output_data.extend_from_slice(&ciphertext);
     
-    // Write to .aes file with progress
-    // Remove trailing path separators before adding .aes extension
+    // Write to .sec file with progress
+    // Remove trailing path separators before adding .sec extension
     let clean_path = file_path.trim_end_matches('/').trim_end_matches('\\');
-    let output_path = format!("{}.aes", clean_path);
+    let output_path = format!("{}.sec", clean_path);
     
     println!("Writing encrypted file...");
     let write_pb = ProgressBar::new(output_data.len() as u64);
@@ -305,34 +421,58 @@ fn encrypt_file(file_path: &str, password: &str) -> Result<()> {
 }
 
 fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
-    // Ensure the file has .aes extension
-    if !file_path.ends_with(".aes") {
-        bail!("File must have .aes extension");
+    // Ensure the file has .sec extension
+    if !file_path.ends_with(".sec") {
+        bail!("File must have .sec extension");
     }
     
     // Read the encrypted file
     let encrypted_data = fs::read(file_path)
         .with_context(|| format!("Failed to read encrypted file: {}", file_path))?;
     
-    // Check minimum file size (directory flag + salt + nonce + at least some ciphertext)
-    if encrypted_data.len() < 1 + SALT_LENGTH + NONCE_LENGTH + 16 {
-        bail!("Invalid encrypted file format");
+    // Check minimum file size (header length + some header + at least some ciphertext)
+    if encrypted_data.len() < 4 + 10 + 16 {
+        bail!("Invalid encrypted file format - file too small");
     }
     
-    // Extract directory flag, salt, nonce, and ciphertext
-    let is_directory = encrypted_data[0] == 1u8;
-    let salt = &encrypted_data[1..1 + SALT_LENGTH];
-    let nonce_bytes = &encrypted_data[1 + SALT_LENGTH..1 + SALT_LENGTH + NONCE_LENGTH];
-    let ciphertext = &encrypted_data[1 + SALT_LENGTH + NONCE_LENGTH..];
+    // Extract CBOR header length (first 4 bytes, little-endian)
+    let header_length = u32::from_le_bytes([
+        encrypted_data[0], encrypted_data[1], encrypted_data[2], encrypted_data[3]
+    ]) as usize;
     
-    // Derive decryption key from password and salt
-    let key = derive_key(password, salt)?;
+    // Validate header length
+    if header_length > encrypted_data.len() - 4 || header_length == 0 {
+        bail!("Invalid CBOR header length: {}", header_length);
+    }
+    
+    // Extract CBOR header and ciphertext
+    let cbor_header_data = &encrypted_data[4..4 + header_length];
+    let ciphertext = &encrypted_data[4 + header_length..];
+    
+    // Deserialize and validate header
+    let header = deserialize_header_from_cbor(cbor_header_data)?;
+    validate_header(&header)?;
+    
+    // Display encryption details
+    println!("File format version: {}", header.version);
+    println!("Encryption: {}", header.encryption_algorithm);
+    println!("Key derivation: {} ({}MB, {} iterations, {} threads)", 
+             header.kdf.algorithm, 
+             header.kdf.memory_cost / 1024,
+             header.kdf.time_cost,
+             header.kdf.parallelism);
+    println!("Content type: {:?}", header.content_type);
+    
+    let is_directory = matches!(header.content_type, ContentType::Directory);
+    
+    // Derive decryption key from password and salt from header
+    let key = derive_key(password, &header.salt)?;
     
     // Create cipher
     let cipher = Aes256Gcm::new_from_slice(&key)
         .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
     
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::from_slice(&header.nonce);
     
     // Decrypt the data
     println!("Decrypting data...");
@@ -350,7 +490,7 @@ fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
     decrypt_pb.inc(ciphertext.len() as u64);
     decrypt_pb.finish_with_message("Decryption complete");
     
-    // Determine output path (remove .aes extension)
+    // Determine output path (remove .sec extension)
     let output_path = &file_path[..file_path.len() - 4];
     
     if is_directory {
@@ -480,12 +620,12 @@ fn interactive_mode() -> Result<()> {
     };
     
     // Determine operation based on file extension
-    let is_decrypt = file_path.ends_with(".aes");
+    let is_decrypt = file_path.ends_with(".sec");
     
     if is_decrypt {
-        println!("Detected .aes file - will decrypt");
+        println!("Detected .sec file - will decrypt");
     } else {
-        println!("Detected non-.aes file - will encrypt");
+        println!("Detected non-.sec file - will encrypt");
     }
     
     // Get password
@@ -534,11 +674,11 @@ fn main() -> Result<()> {
             }
             
             // Infer operation based on file extension
-            if file.ends_with(".aes") {
-                println!("Detected .aes file - decrypting...");
+            if file.ends_with(".sec") {
+                println!("Detected .sec file - decrypting...");
                 decrypt_file(&file, &password)?;
             } else {
-                println!("Detected non-.aes file - encrypting...");
+                println!("Detected non-.sec file - encrypting...");
                 encrypt_file(&file, &password)?;
             }
         },
