@@ -44,21 +44,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aesify"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "argon2",
- "ciborium",
- "clap",
- "indicatif",
- "rand",
- "serde",
- "zip",
-]
-
-[[package]]
 name = "anstream"
 version = "0.6.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -685,6 +670,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.16",
+]
+
+[[package]]
+name = "secify"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "ciborium",
+ "clap",
+ "indicatif",
+ "rand",
+ "serde",
+ "zip",
 ]
 
 [[package]]

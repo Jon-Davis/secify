@@ -17,7 +17,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Serialize, Deserialize};
 
 #[derive(Parser)]
-#[command(name = "aesify")]
+#[command(name = "secify")]
 #[command(about = "A CLI tool for encrypting and decrypting files and directories using AES-256-GCM with Argon2 key derivation")]
 struct Cli {
     /// Input file or directory path (.sec files will be decrypted, others will be encrypted)
@@ -599,7 +599,7 @@ fn list_current_directory() -> Result<()> {
 }
 
 fn interactive_mode() -> Result<()> {
-    println!("=== AESify Interactive Mode ===\n");
+    println!("=== Secify Interactive Mode ===\n");
     
     // Get file path
     let file_path = loop {

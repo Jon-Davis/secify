@@ -1,111 +1,140 @@
-# AESify
+# Secify
 
-A command-line tool for encrypting and decrypting files using AES-256-GCM encryption with Argon2 key derivation.
-
-## Features
-
-- **Strong Encryption**: Uses AES-256-GCM for authenticated encryption
-- **Secure Key Derivation**: Uses Argon2 to derive encryption keys from passwords
-- **File Safety**: Prevents overwriting existing files during decryption
-- **Interactive Mode**: User-friendly step-by-step dialog when no arguments provided
-- **Command Line Interface**: Direct command-line usage for automation and scripts
+A modern CLI tool for encrypting and decrypting files and directories using industry-standard cryptography. Secify creates `.sec` files (Securely Encrypted Container) with a CBOR-based header format that supports multiple encryption algorithms and extensible metadata.
 
 ## Installation
 
-Make sure you have Rust installed, then clone and build the project:
-
+### From Source
 ```bash
-git clone <repository-url>
-cd aesify
+git clone https://github.com/yourusername/secify
+cd secify
 cargo build --release
 ```
+
+The binary will be available at `target/release/secify.exe` (Windows) or `target/release/secify` (Unix).
 
 ## Usage
 
-### Interactive Mode
-
-Simply run the program without any arguments to start the interactive mode:
-
+### Interactive Mode (Recommended)
 ```bash
-aesify
+secify
 ```
 
-This will guide you through the process step by step:
-1. Choose whether to encrypt or decrypt
-2. Enter the file path
-3. Enter the password (with confirmation for encryption)
-
-The interactive mode includes helpful validation:
-- Checks if files exist before processing
-- Ensures .aes extension for decryption
-- Requires password confirmation for encryption
-- Validates minimum password length (4 characters)
+Secify will automatically:
+1. Prompt for the file/directory path
+2. Detect if it's a `.sec` file (decrypt) or regular file/directory (encrypt)
+3. Prompt for password
+4. Perform the appropriate operation
 
 ### Command Line Mode
-
-### Encrypting a File
-
 ```bash
-aesify encrypt --file <filename> --password <password>
+# Encrypt a file
+secify document.pdf
+
+# Encrypt a directory
+secify /path/to/folder
+
+# Decrypt a .sec file
+secify document.pdf.sec
+
+# With password 
+secify -p mypassword document.pdf
 ```
 
-This will create a new file with the `.aes` extension containing the encrypted data.
+## File Format: Securely Encrypted Container (.sec)
 
-Example:
-```bash
-aesify encrypt --file document.txt --password "mySecurePassword123"
-# Creates: document.txt.aes
+### Format Specification
+
+The `.sec` format is a binary container with the following structure:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    .sec File Format                         │
+├─────────────────────────────────────────────────────────────┤
+│ Header Length    │ 4 bytes (little-endian u32)              │
+├─────────────────────────────────────────────────────────────┤
+│ CBOR Header      │ Variable length (self-describing)        │
+├─────────────────────────────────────────────────────────────┤
+│ Encrypted Data   │ Variable length (algorithm-specific)     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Decrypting a File
+### CBOR Header Structure
 
-```bash
-aesify decrypt --file <filename.aes> --password <password>
+The header contains all encryption metadata in CBOR format:
+
+```rust
+{
+  "version": 1,                           // File format version
+  "encryption_algorithm": "AES-256-GCM",  // Encryption method
+  "kdf": {                                // Key derivation function
+    "algorithm": "Argon2id",
+    "version": "0x13",                    // Argon2 version 1.3
+    "memory_cost": 131072,                // 128 MB in KB
+    "time_cost": 8,                       // 8 iterations
+    "parallelism": 4,                     // 4 threads
+    "output_length": 32                   // 32-byte key
+  },
+  "compression": {
+    "method": "ZIP-Stored",               // Compression algorithm
+    "enabled": true                       // For directories only
+  },
+  "content_type": "File" | "Directory",   // Content type
+  "salt": [32 bytes],                     // Random salt for key derivation
+  "nonce": [12 bytes]                     // Random nonce for AES-GCM
+}
 ```
 
-This will decrypt the `.aes` file and restore the original file.
+## Examples
 
-Example:
+### Encrypting a Document
 ```bash
-aesify decrypt --file document.txt.aes --password "mySecurePassword123"
-# Creates: document.txt
+$ secify document.pdf
+=== Secify Interactive Mode ===
+
+Enter file or directory path: document.pdf
+Detected non-.sec file - encrypting...
+Enter password: [hidden input]
+[████████████████████] 100% - Encryption complete
+File encrypted successfully: document.pdf.sec
 ```
 
-## Security Features
-
-- **AES-256-GCM**: Provides both confidentiality and authenticity
-- **Argon2**: Memory-hard key derivation function resistant to brute-force attacks
-- **Random Salt**: Each encrypted file uses a unique random salt
-- **Random Nonce**: Each encryption uses a unique random nonce
-- **Password Verification**: Wrong passwords are detected and rejected
-
-## File Format
-
-The encrypted `.aes` files contain:
-1. Salt (32 bytes) - Used for key derivation
-2. Nonce (12 bytes) - Used for AES-GCM encryption
-3. Ciphertext - The encrypted file data with authentication tag
-
-## Security Considerations
-
-- Use strong, unique passwords
-- Keep your passwords secure and don't share them
-- The program doesn't store passwords - you must remember them
-- Losing the password means losing access to the encrypted data
-- The encrypted files are only as secure as your password
-
-## Building from Source
-
+### Decrypting a Container
 ```bash
-cargo build --release
+$ secify document.pdf.sec
+=== Secify Interactive Mode ===
+
+Enter file or directory path: document.pdf.sec
+Detected .sec file - decrypting...
+Enter password: [hidden input]
+File format version: 1
+Encryption: AES-256-GCM
+Key derivation: Argon2id (128MB, 8 iterations, 4 threads)
+Content type: File
+[████████████████████] 100% - Decryption complete
+File decrypted successfully: document.pdf
 ```
 
-The executable will be available at `target/release/aesify` (or `aesify.exe` on Windows).
+### Encrypting a Directory
+```bash
+$ secify /home/user/documents
+=== Secify Interactive Mode ===
 
-## Dependencies
+Enter file or directory path: /home/user/documents
+Detected non-.sec file - encrypting...
+Enter password: [hidden input]
+Zipping directory...
+[████████████████████] 100% - Encryption complete
+Directory zipped and encrypted successfully: /home/user/documents.sec
+```
 
-- `aes-gcm`: AES-GCM encryption
-- `argon2`: Key derivation
-- `clap`: Command-line argument parsing
-- `rand`: Random number generation
-- `anyhow`: Error handling
+## Error Handling
+
+Secify provides clear error messages for common issues:
+
+- **Wrong Password**: "Failed to decrypt data - incorrect password or corrupted file"
+- **Corrupted File**: "Invalid encrypted file format"
+- **Version Mismatch**: "Unsupported file format version"
+- **Missing Files**: "Failed to read file: [filename]"
+
+
