@@ -11,58 +11,6 @@ This is just a personal project, to explore different encryption methods.
 - **Directory Support**: Encrypts entire folders while preserving structure
 - **Future-Proof**: Extensible CBOR header format for algorithm upgrades
 
-## Installation
-
-### From Source
-```bash
-git clone https://github.com/yourusername/secify
-cd secify
-cargo build --release
-```
-
-The binary will be available at `target/release/secify.exe` (Windows) or `target/release/secify` (Unix).
-
-## Usage
-
-Secify automatically detects whether to encrypt or decrypt based on the file extension:
-- **Regular files/folders** → Encrypt to `.sec` format
-- **`.sec` files** → Decrypt to original format
-
-### Interactive Mode (Recommended)
-```bash
-secify
-```
-
-Follow the prompts to:
-1. Select your file or directory
-2. Choose encryption algorithm (for new encryptions)
-3. Enter a secure password
-4. Watch the progress as your data is protected
-
-### Command Line Mode
-```bash
-# Encrypt a file with default settings (XChaCha20-Poly1305, 128MB memory, 8 iterations, 4 threads)
-secify document.pdf
-
-# Encrypt with specific algorithm
-secify -a aes256 document.pdf
-
-# Encrypt with custom Argon2 parameters for higher security
-secify --memory-mb 256 --time-cost 12 --parallelism 8 document.pdf
-
-# Encrypt with faster Argon2 parameters for performance
-secify --memory-mb 64 --time-cost 4 --parallelism 2 document.pdf
-
-# Encrypt a directory
-secify /path/to/folder
-
-# Decrypt a .sec file
-secify document.pdf.sec
-
-# Provide password via command line (less secure)
-secify -p mypassword document.pdf
-```
-
 ### Algorithm Selection
 - **XChaCha20-Poly1305** (default): 192-bit nonce prevents collisions
 - **AES-256-GCM**: Hardware accelerated on most modern CPUs
@@ -90,6 +38,18 @@ Secify uses Argon2id for key derivation with customizable parameters:
 
 ## File Format: Securely Encrypted Container (.sec)
 
+### Streaming Architecture
+
+Secify implements a fully streaming pipeline for optimal memory efficiency:
+
+**Read → Archive → Encrypt → Write Pipeline:**
+- **Files**: Content is read in chunks, directly streamed through TAR archiver, then encrypted and written
+- **Directories**: Files are recursively added to TAR stream, encrypted on-the-fly, and written incrementally
+- **Memory Usage**: Constant memory usage regardless of file/directory size (only chunk-size buffers)
+- **Performance**: No temporary files, no full-data buffering, immediate encryption of each chunk
+
+This streaming approach enables encryption of arbitrarily large files and directories without memory constraints.
+
 ### Format Specification
 
 The `.sec` format is a binary container with the following structure:
@@ -102,7 +62,7 @@ The `.sec` format is a binary container with the following structure:
 ├─────────────────────────────────────────────────────────────┤
 │ CBOR Header      │ Variable length (self-describing)        │
 ├─────────────────────────────────────────────────────────────┤
-│ Encrypted Data   │ Variable length (data-specific)          │
+│ Encrypted Tar    │ Variable length (data-specific)          │
 ├─────────────────────────────────────────────────────────────┤
 │ File HMAC        │ 32 bytes (HMAC-SHA256 of plaintext)      │
 └─────────────────────────────────────────────────────────────┘
@@ -124,11 +84,6 @@ The header contains all encryption metadata in CBOR format:
     "parallelism": 4,                     // 4 threads
     "output_length": 32                   // 32-byte key
   },
-  "compression": {
-    "method": "ZIP-Stored",               // Compression algorithm
-    "enabled": true                       // For directories only
-  },
-  "content_type": "File" | "Directory",   // Content type
   "salt": [32 bytes],                     // Random salt for key derivation
   "nonce": [8/16 bytes],                  // Base nonce for chunked encryption
   "chunk_size": 65536                     // Chunk size in bytes (64KB default)
@@ -137,7 +92,7 @@ The header contains all encryption metadata in CBOR format:
 
 ### Chunked Encryption Format
 
-Data is encrypted in fixed-size chunks for efficient streaming and memory usage. The new format eliminates per-chunk length prefixes by using a consistent chunk size:
+Data is encrypted in fixed-size chunks for efficient streaming and memory usage. 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -157,7 +112,6 @@ Data is encrypted in fixed-size chunks for efficient streaming and memory usage.
 
 **Format Benefits:**
 - **Fixed-Size Chunks**: Each encrypted chunk (except the last) is exactly `chunk_size` bytes
-- **No Length Prefixes**: Eliminates 4-byte length headers, reducing overhead  
 - **Streaming-Friendly**: No need to know total data length upfront - process chunks as they arrive
 - **Natural Termination**: Decryption completes when ciphertext is exhausted
 
@@ -184,72 +138,61 @@ The `.sec` format provides comprehensive integrity protection through multiple l
 
 ## Examples
 
-### Encrypting a Document
+### Encrypting a Folder
 ```bash
-$ secify document.pdf
+$ secify
 === Secify Interactive Mode ===
 
-Enter file or directory path: document.pdf
-Detected non-.sec file - encrypting...
+Enter the file or directory path (type 'ls' to list files): test_dir
+Detected non-.sec file - will encrypt
 
 Select encryption algorithm:
 1. AES-256-GCM (hardware accelerated on most CPUs, 96-bit nonce)
 2. ChaCha20-Poly1305 (faster on mobile/older CPUs, 96-bit nonce)
 3. XChaCha20-Poly1305 (default, recommended for high-volume use, 192-bit nonce)
-Enter choice (1, 2, or 3, default is 3): 
+Enter choice (1, 2, or 3, default is 3):
 
 Argon2id Key Derivation Settings:
 Current: 128MB memory, 8 iterations, 4 threads
-Customize Argon2 parameters? (y/N): y
-Memory cost in MB (8-2048, current: 128): 256
-Time cost/iterations (1-100, current: 8): 12
-Parallelism/threads (1-16, current: 4): 8
-Final Argon2id settings: 256MB memory, 12 iterations, 8 threads
+Customize Argon2 parameters? (y/N):
+Enter password for encryption: 
 
-Enter password for encryption: [hidden input]
-Confirm password: [hidden input]
-[████████████████████] 100% - Encryption complete
-File encrypted successfully: document.pdf.sec
+Confirm password:
+
+
+Encrypting file...
+Using TAR archive format with full streaming pipeline (read→tar→encrypt→write)
+Streaming directory encryption with full pipeline (TAR)...
+Deriving encryption key with Argon2id (128MB, 8 iterations, 4 threads)...
+Argon2 key derivation completed in 0.49 seconds
+Counting files...
+  Streaming TAR [00:00:00] [########################################] 4/4 Streaming directory encryption complete                                                                                                                  
+Directory encrypted successfully: test_dir.sec
 ```
 
-### Command Line with Custom Argon2
+### Decrypting a Folder
 ```bash
-$ secify --memory-mb 512 --time-cost 16 --parallelism 8 -a aes256 sensitive_data.pdf
-Detected non-.sec file - encrypting...
-Using encryption algorithm: AES-256-GCM
-Using Argon2id parameters: 512MB memory, 16 iterations, 8 threads
-Enter password for encryption: [hidden input]
-Deriving encryption key with Argon2id (512MB, 16 iterations, 8 threads)...
-Argon2 key derivation completed in 4.23 seconds
-[████████████████████] 100% - Encryption complete
-File encrypted successfully: sensitive_data.pdf.sec
-```
-
-### Decrypting a Container
-```bash
-$ secify document.pdf.sec
 === Secify Interactive Mode ===
 
-Enter file or directory path: document.pdf.sec
-Detected .sec file - decrypting...
-Enter password: [hidden input]
+Enter the file or directory path (type 'ls' to list files): test_dir.sec
+Detected .sec file - will decrypt
+Enter password for decryption:
+
+
+Decrypting file...
+TAR archive detected - using streaming decryption
 File format version: 1
-Encryption: AES-256-GCM
+Encryption: XChaCha20-Poly1305
 Key derivation: Argon2id (128MB, 8 iterations, 4 threads)
-Content type: File
-[████████████████████] 100% - Decryption complete
-File decrypted successfully: document.pdf
-```
-
-### Encrypting a Directory
-```bash
-$ secify /home/user/documents
-=== Secify Interactive Mode ===
-
-Enter file or directory path: /home/user/documents
-Detected non-.sec file - encrypting...
-Enter password: [hidden input]
-Zipping directory...
-[████████████████████] 100% - Encryption complete
-Directory zipped and encrypted successfully: /home/user/documents.sec
+Chunked encryption: 64KB chunks
+Deriving encryption key with Argon2id (128MB, 8 iterations, 4 threads)...
+Argon2 key derivation completed in 0.49 seconds
+Decrypting data...
+  Decrypting [00:00:00] [########################################] 4.52 KiB/4.52 KiB (12.17 MiB/s, 0s)                                                                                                                             
+Verifying file integrity...
+File integrity verified successfully
+Extracting TAR directory...
+Extracting TAR archive...
+  Extracting TAR [00:00:00] [########################################] 4/4 TAR extraction complete!                                                                                                                                
+Directory decrypted and extracted successfully: test_dir
 ```

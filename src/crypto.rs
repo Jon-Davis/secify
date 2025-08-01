@@ -133,10 +133,6 @@ pub struct EncryptionHeader {
     pub encryption_algorithm: String,
     /// Key derivation function details
     pub kdf: KeyDerivationConfig,
-    /// Compression details
-    pub compression: CompressionConfig,
-    /// Content type (file or directory)
-    pub content_type: ContentType,
     /// Salt for key derivation
     pub salt: Vec<u8>,
     /// Nonce/IV for encryption (base nonce for chunked encryption)
@@ -159,20 +155,6 @@ pub struct KeyDerivationConfig {
     pub parallelism: u32,
     /// Output length in bytes
     pub output_length: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct CompressionConfig {
-    /// Compression method used
-    pub method: String,
-    /// Whether compression was applied
-    pub enabled: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum ContentType {
-    File,
-    Directory,
 }
 
 pub fn generate_secure_random_bytes(buffer: &mut [u8]) -> Result<()> {
@@ -367,7 +349,7 @@ pub fn decrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENG
     Ok(result)
 }
 
-pub fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool, algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32) -> EncryptionHeader {
+pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32) -> EncryptionHeader {
     EncryptionHeader {
         version: FILE_FORMAT_VERSION,
         encryption_algorithm: algorithm.to_string().to_owned(),
@@ -379,11 +361,6 @@ pub fn create_encryption_header(salt: &[u8], nonce: &[u8], is_directory: bool, a
             parallelism: argon2_params.parallelism,
             output_length: KEY_LENGTH as u32,
         },
-        compression: CompressionConfig {
-            method: "ZIP-Stored".to_owned(),
-            enabled: is_directory,
-        },
-        content_type: if is_directory { ContentType::Directory } else { ContentType::File },
         salt: salt.to_vec(),
         nonce: nonce.to_vec(),
         chunk_size,
@@ -690,24 +667,20 @@ mod tests {
         let params = create_fast_test_params();
         
         // Test file header with chunked encryption
-        let header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         assert_eq!(header.version, FILE_FORMAT_VERSION);
         assert_eq!(header.encryption_algorithm, "XChaCha20-Poly1305");
         assert_eq!(header.kdf.algorithm, "Argon2id");
         assert_eq!(header.kdf.memory_cost, params.memory_kb());
         assert_eq!(header.kdf.time_cost, params.time_cost);
         assert_eq!(header.kdf.parallelism, params.parallelism);
-        assert!(!header.compression.enabled);
-        assert!(matches!(header.content_type, ContentType::File));
         assert_eq!(header.salt, salt.to_vec());
         assert_eq!(header.nonce, base_nonce);
         assert_eq!(header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
         
-        // Test directory header with chunked encryption (removed legacy mode test since we don't support it)
-        let dir_header = create_encryption_header(&salt, &base_nonce, true, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
-        assert!(dir_header.compression.enabled);
-        assert!(matches!(dir_header.content_type, ContentType::Directory));
-        assert_eq!(dir_header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
+        // All headers are now archives in TAR format
+        let archive_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        assert_eq!(archive_header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
     }
 
     #[test]
@@ -716,7 +689,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let original_header = create_encryption_header(&salt, &base_nonce, true, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        let original_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Serialize to CBOR
         let cbor_data = serialize_header_to_cbor(&original_header).unwrap();
@@ -741,7 +714,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Valid header should pass validation
         assert!(validate_header(&header).is_ok());
@@ -753,7 +726,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid version
         header.version = FILE_FORMAT_VERSION + 1;
@@ -766,7 +739,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid algorithm
         header.encryption_algorithm = "Invalid-Algorithm".to_string();
@@ -779,7 +752,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid KDF
         header.kdf.algorithm = "PBKDF2".to_string();
@@ -792,7 +765,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid salt length
         header.salt = vec![1u8; 16]; // Wrong length
@@ -805,7 +778,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, false, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid nonce length (AES-GCM expects 8-byte base nonce, so use 4 bytes to make it invalid)
         header.nonce = vec![2u8; 4]; // Wrong length for AES-GCM base nonce
@@ -1088,4 +1061,141 @@ mod tests {
         modified_data[512 * 1024] ^= 0x01; // Flip a bit in the middle
         assert!(!verify_hmac(&modified_data, &key, &salt, &hmac).unwrap());
     }
+
+    #[test]
+    fn test_argon2_params_validation() {
+        // Test valid parameters
+        assert!(Argon2Params::new(8, 1, 1).is_ok());
+        assert!(Argon2Params::new(64, 3, 4).is_ok());
+        
+        // Test invalid parameters (these should fail based on Argon2 constraints)
+        assert!(Argon2Params::new(0, 1, 1).is_err()); // Zero memory
+        assert!(Argon2Params::new(1, 0, 1).is_err()); // Zero time cost
+        assert!(Argon2Params::new(1, 1, 0).is_err()); // Zero parallelism
+    }
+
+    #[test]
+    fn test_argon2_params_memory_conversion() {
+        let params = Argon2Params::new(64, 2, 2).unwrap();
+        assert_eq!(params.memory_kb(), 64 * 1024); // Should convert MB to KB
+    }
+
+    #[test]
+    fn test_generate_base_nonce_lengths() {
+        // Test that base nonces have correct lengths for each algorithm
+        let aes_base_nonce = generate_base_nonce(&EncryptionAlgorithm::Aes256Gcm).unwrap();
+        assert_eq!(aes_base_nonce.len(), 8);
+        
+        let chacha_base_nonce = generate_base_nonce(&EncryptionAlgorithm::ChaCha20Poly1305).unwrap();
+        assert_eq!(chacha_base_nonce.len(), 8);
+        
+        let xchacha_base_nonce = generate_base_nonce(&EncryptionAlgorithm::XChaCha20Poly1305).unwrap();
+        assert_eq!(xchacha_base_nonce.len(), 16);
+    }
+
+    #[test]
+    fn test_encryption_algorithm_auth_tag_size() {
+        // All AEAD algorithms should have 16-byte authentication tags
+        assert_eq!(EncryptionAlgorithm::Aes256Gcm.auth_tag_size(), 16);
+        assert_eq!(EncryptionAlgorithm::ChaCha20Poly1305.auth_tag_size(), 16);
+        assert_eq!(EncryptionAlgorithm::XChaCha20Poly1305.auth_tag_size(), 16);
+    }
+
+    #[test]
+    fn test_chunked_encryption_boundary_conditions() {
+        let algorithm = EncryptionAlgorithm::Aes256Gcm;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        // Test with chunk size exactly equal to auth tag size (should fail)
+        let result = encrypt_data_chunked(&algorithm, &key, &base_nonce, TEST_DATA, 16);
+        assert!(result.is_err());
+        
+        // Test with chunk size one byte larger than auth tag size (should work)
+        let result = encrypt_data_chunked(&algorithm, &key, &base_nonce, TEST_DATA, 17);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_header_zero_chunk_size() {
+        let algorithm = EncryptionAlgorithm::Aes256Gcm;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, 0);
+        
+        // Zero chunk size should be invalid
+        assert!(validate_header(&header).is_err());
+    }
+
+    #[test]
+    fn test_cbor_serialization_roundtrip_all_algorithms() {
+        let algorithms = [
+            EncryptionAlgorithm::Aes256Gcm,
+            EncryptionAlgorithm::ChaCha20Poly1305,
+            EncryptionAlgorithm::XChaCha20Poly1305,
+        ];
+        
+        for algorithm in &algorithms {
+            let salt = create_test_salt();
+            let base_nonce = create_test_base_nonce(algorithm);
+            let params = create_fast_test_params();
+            let original_header = create_encryption_header(&salt, &base_nonce, algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+            
+            // Serialize and deserialize
+            let cbor_data = serialize_header_to_cbor(&original_header).unwrap();
+            let deserialized_header = deserialize_header_from_cbor(&cbor_data).unwrap();
+            
+            // Validate both headers
+            assert!(validate_header(&original_header).is_ok());
+            assert!(validate_header(&deserialized_header).is_ok());
+            
+            // Check algorithm-specific fields
+            assert_eq!(original_header.encryption_algorithm, deserialized_header.encryption_algorithm);
+            assert_eq!(original_header.nonce.len(), deserialized_header.nonce.len());
+        }
+    }
+
+    #[test]
+    fn test_content_type_archive_only() {
+        // Test that all headers now use TAR archive format
+        let algorithm = EncryptionAlgorithm::Aes256Gcm;
+        let salt = create_test_salt();
+        let base_nonce = create_test_base_nonce(&algorithm);
+        let params = create_fast_test_params();
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
+        
+        // Verify header was created successfully (TAR format is implicit now)
+        assert_eq!(header.version, FILE_FORMAT_VERSION);
+        assert_eq!(header.encryption_algorithm, algorithm.to_string());
+    }
+
+    #[test]
+    fn test_hmac_with_empty_salt() {
+        let empty_salt = [0u8; SALT_LENGTH];
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &empty_salt, &params).unwrap();
+        
+        // Should work with empty salt (all zeros)
+        let hmac = compute_hmac(TEST_DATA, &key, &empty_salt).unwrap();
+        assert_eq!(hmac.len(), 32);
+        assert!(verify_hmac(TEST_DATA, &key, &empty_salt, &hmac).unwrap());
+    }
+
+    #[test]
+    fn test_encryption_with_maximum_chunk_counter() {
+        let algorithm = EncryptionAlgorithm::Aes256Gcm;
+        let base_nonce = create_test_base_nonce(&algorithm);
+        
+        // Test with maximum 32-bit counter value
+        let max_counter = u32::MAX as u64;
+        let result = create_chunk_nonce(&algorithm, &base_nonce, max_counter);
+        assert!(result.is_ok());
+        
+        let nonce = result.unwrap();
+        assert_eq!(nonce.len(), algorithm.nonce_length());
+    }
+
 }

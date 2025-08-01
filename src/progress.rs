@@ -24,3 +24,13 @@ pub fn create_byte_progress_bar(length: u64, operation: &str) -> ProgressBar {
         &format!("{{spinner:.green}} {operation} [{{elapsed_precise}}] [{{bar:40.yellow/red}}] {{bytes}}/{{total_bytes}} ({{bytes_per_sec}}, {{eta}})")
     )
 }
+
+pub fn create_indefinite_progress_bar(operation: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template(&format!("{{spinner:.green}} {operation} [{{elapsed_precise}}] {{msg}}"))
+            .unwrap_or_else(|_| ProgressStyle::default_spinner())
+    );
+    pb
+}
