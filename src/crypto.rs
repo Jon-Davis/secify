@@ -121,7 +121,7 @@ pub fn parse_algorithm(s: &str) -> Result<EncryptionAlgorithm, String> {
         "aes256" | "aes" | "aes-256-gcm" => Ok(EncryptionAlgorithm::Aes256Gcm),
         "chacha20" | "chacha" | "chacha20-poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
         "xchacha20" | "xchacha" | "xchacha20-poly1305" => Ok(EncryptionAlgorithm::XChaCha20Poly1305),
-        _ => Err(format!("Invalid algorithm '{}'. Valid options: aes256, chacha20, xchacha20", s)),
+        _ => Err(format!("Invalid algorithm '{s}'. Valid options: aes256, chacha20, xchacha20")),
     }
 }
 
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(header.kdf.memory_cost, params.memory_kb());
         assert_eq!(header.kdf.time_cost, params.time_cost);
         assert_eq!(header.kdf.parallelism, params.parallelism);
-        assert_eq!(header.compression.enabled, false);
+        assert!(!header.compression.enabled);
         assert!(matches!(header.content_type, ContentType::File));
         assert_eq!(header.salt, salt.to_vec());
         assert_eq!(header.nonce, base_nonce);
@@ -705,7 +705,7 @@ mod tests {
         
         // Test directory header with chunked encryption (removed legacy mode test since we don't support it)
         let dir_header = create_encryption_header(&salt, &base_nonce, true, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
-        assert_eq!(dir_header.compression.enabled, true);
+        assert!(dir_header.compression.enabled);
         assert!(matches!(dir_header.content_type, ContentType::Directory));
         assert_eq!(dir_header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
     }

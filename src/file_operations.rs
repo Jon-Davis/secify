@@ -193,7 +193,7 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
     generate_secure_random_bytes(&mut salt)?;
     
     // Derive encryption key from password and salt (this is the slow step)
-    let key = derive_key(password, &salt, &argon2_params)?;
+    let key = derive_key(password, &salt, argon2_params)?;
     
     // Now do the progress-tracked operations
     // Determine what we're encrypting
@@ -204,20 +204,20 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
     } else {
         // Read the input file
         let file_data = fs::read(file_path)
-            .with_context(|| format!("Failed to read file: {}", file_path))?;
+            .with_context(|| format!("Failed to read file: {file_path}"))?;
         (file_data, false)
     };
     
     // Encrypt the data using chunked encryption for all algorithms
     println!("Encrypting data...");
-    let ciphertext = encrypt_data_chunked(&algorithm, &key, &base_nonce, &input_data, DEFAULT_CHUNK_SIZE)?;
+    let ciphertext = encrypt_data_chunked(algorithm, &key, &base_nonce, &input_data, DEFAULT_CHUNK_SIZE)?;
     
     // Compute HMAC of the plaintext for file integrity verification
     println!("Computing file integrity checksum...");
     let hmac = compute_hmac(&input_data, &key, &salt)?;
     
     // Create CBOR header with encryption details including chunk size
-    let header = create_encryption_header(&salt, &base_nonce, is_directory, &algorithm, &argon2_params, DEFAULT_CHUNK_SIZE as u32);
+    let header = create_encryption_header(&salt, &base_nonce, is_directory, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32);
     let cbor_header = serialize_header_to_cbor(&header)?;
     
     // Create output file structure: 
@@ -235,14 +235,14 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
     // Write to .sec file with progress
     // Remove trailing path separators before adding .sec extension
     let clean_path = file_path.trim_end_matches('/').trim_end_matches('\\');
-    let output_path = format!("{}.sec", clean_path);
+    let output_path = format!("{clean_path}.sec");
     
     println!("Writing encrypted file...");
     let write_pb = create_byte_progress_bar(output_data.len() as u64, "Writing");
     
     // Write in chunks to show progress
     let mut output_file = fs::File::create(&output_path)
-        .with_context(|| format!("Failed to create encrypted file: {}", output_path))?;
+        .with_context(|| format!("Failed to create encrypted file: {output_path}"))?;
     
     for chunk in output_data.chunks(WRITE_CHUNK_SIZE) {
         output_file.write_all(chunk)
@@ -253,9 +253,9 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
     write_pb.finish_with_message("Writing complete");
     
     if is_directory {
-        println!("Directory zipped and encrypted successfully: {}", output_path);
+        println!("Directory zipped and encrypted successfully: {output_path}");
     } else {
-        println!("File encrypted successfully: {}", output_path);
+        println!("File encrypted successfully: {output_path}");
     }
     Ok(())
 }
@@ -268,7 +268,7 @@ pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
     
     // Read the encrypted file
     let encrypted_data = fs::read(file_path)
-        .with_context(|| format!("Failed to read encrypted file: {}", file_path))?;
+        .with_context(|| format!("Failed to read encrypted file: {file_path}"))?;
     
     // Check minimum file size (header length + some header + at least some ciphertext)
     if encrypted_data.len() < 4 + 10 + 16 {
@@ -361,13 +361,13 @@ pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
         
         // Create the output directory
         fs::create_dir_all(output_path)
-            .with_context(|| format!("Failed to create output directory: {}", output_path))?;
+            .with_context(|| format!("Failed to create output directory: {output_path}"))?;
         
         // Unzip the decrypted data to the directory
         println!("Unzipping directory...");
         unzip_to_directory(&plaintext, Path::new(output_path))?;
         
-        println!("Directory decrypted and unzipped successfully: {}", output_path);
+        println!("Directory decrypted and unzipped successfully: {output_path}");
     } else {
         // Check if output file already exists
         if Path::new(output_path).exists() {
@@ -379,7 +379,7 @@ pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
         let write_pb = create_byte_progress_bar(plaintext.len() as u64, "Writing");
         
         let mut output_file = fs::File::create(output_path)
-            .with_context(|| format!("Failed to create decrypted file: {}", output_path))?;
+            .with_context(|| format!("Failed to create decrypted file: {output_path}"))?;
         
         for chunk in plaintext.chunks(WRITE_CHUNK_SIZE) {
             output_file.write_all(chunk)
@@ -389,7 +389,7 @@ pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
         
         write_pb.finish_with_message("Writing complete");
         
-        println!("File decrypted successfully: {}", output_path);
+        println!("File decrypted successfully: {output_path}");
     }
     
     Ok(())

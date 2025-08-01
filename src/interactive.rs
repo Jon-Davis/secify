@@ -8,7 +8,7 @@ use crate::cli::{DEFAULT_ALGORITHM, MIN_PASSWORD_LENGTH};
 use crate::file_operations::{encrypt_file, decrypt_file};
 
 pub fn prompt_user(prompt: &str) -> Result<String> {
-    print!("{}", prompt);
+    print!("{prompt}");
     io::stdout().flush().context("Failed to flush stdout")?;
     
     let mut input = String::new();
@@ -19,7 +19,7 @@ pub fn prompt_user(prompt: &str) -> Result<String> {
 }
 
 pub fn get_password(prompt: &str) -> Result<String> {
-    print!("{}", prompt);
+    print!("{prompt}");
     io::stdout().flush().context("Failed to flush stdout")?;
     
     let password = rpassword::read_password()
@@ -50,7 +50,7 @@ pub fn list_current_directory() -> Result<()> {
         let name = entry.file_name().to_string_lossy().to_string();
         
         if path.is_dir() {
-            dirs.push(format!("{}/", name));
+            dirs.push(format!("{name}/"));
         } else {
             files.push(name);
         }
@@ -61,10 +61,10 @@ pub fn list_current_directory() -> Result<()> {
     files.sort();
     
     for dir in dirs {
-        println!("  📁 {}", dir);
+        println!("  📁 {dir}");
     }
     for file in files {
-        println!("  📄 {}", file);
+        println!("  📄 {file}");
     }
     println!();
     
@@ -91,7 +91,7 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
             continue;
         }
         if !Path::new(&path).exists() {
-            println!("File or directory '{}' does not exist. Please check the path.", path);
+            println!("File or directory '{path}' does not exist. Please check the path.");
             continue;
         }
         break path;
@@ -147,7 +147,7 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
                                 argon2_params = new_params;
                                 break;
                             }
-                            Err(e) => println!("Invalid memory cost: {}", e),
+                            Err(e) => println!("Invalid memory cost: {e}"),
                         }
                     }
                     Err(_) => println!("Invalid number. Please enter a value between 8 and 2048."),
@@ -167,7 +167,7 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
                                 argon2_params = new_params;
                                 break;
                             }
-                            Err(e) => println!("Invalid time cost: {}", e),
+                            Err(e) => println!("Invalid time cost: {e}"),
                         }
                     }
                     Err(_) => println!("Invalid number. Please enter a value between 1 and 100."),
@@ -187,7 +187,7 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
                                 argon2_params = new_params;
                                 break;
                             }
-                            Err(e) => println!("Invalid parallelism: {}", e),
+                            Err(e) => println!("Invalid parallelism: {e}"),
                         }
                     }
                     Err(_) => println!("Invalid number. Please enter a value between 1 and 16."),
@@ -209,7 +209,7 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
         if !is_decrypt {
             // Only require password validation for encryption
             if pass.len() < MIN_PASSWORD_LENGTH {
-                println!("Password must be at least {} characters long for security.", MIN_PASSWORD_LENGTH);
+                println!("Password must be at least {MIN_PASSWORD_LENGTH} characters long for security.");
                 continue;
             }
             
