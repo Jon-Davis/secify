@@ -1,14 +1,15 @@
 use std::fs;
 use std::path::Path;
 use std::io::{self, Write};
+use std::time::Instant;
 
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce
 };
-use argon2::{Argon2, PasswordHasher};
+use argon2::{Argon2, Algorithm, Version, Params, PasswordHasher};
 use argon2::password_hash::{rand_core::RngCore, SaltString};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use anyhow::{Result, Context, bail};
 use zip::{ZipWriter, ZipArchive, write::FileOptions, CompressionMethod};
 use std::io::Cursor;
@@ -18,30 +19,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 #[command(name = "aesify")]
 #[command(about = "A CLI tool for encrypting and decrypting files and directories using AES-256-GCM with Argon2 key derivation")]
 struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Encrypt a file or directory
-    Encrypt {
-        /// Input file or directory path
-        #[arg(short, long)]
-        file: String,
-        /// Password for encryption
-        #[arg(short, long)]
-        password: String,
-    },
-    /// Decrypt a file
-    Decrypt {
-        /// Input .aes file path
-        #[arg(short, long)]
-        file: String,
-        /// Password for decryption
-        #[arg(short, long)]
-        password: String,
-    },
+    /// Input file or directory path (.aes files will be decrypted, others will be encrypted)
+    file: Option<String>,
+    /// Password for encryption/decryption
+    #[arg(short, long)]
+    password: Option<String>,
 }
 
 const SALT_LENGTH: usize = 32;
@@ -49,13 +31,27 @@ const NONCE_LENGTH: usize = 12;
 const KEY_LENGTH: usize = 32;
 
 fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LENGTH]> {
-    let argon2 = Argon2::default();
+    // Explicit Argon2id parameters for security and transparency
+    let params = Params::new(
+        131072, // memory cost: 128 MB
+        8,     // time cost: 8 iterations
+        4,     // parallelism: 4 threads
+        Some(KEY_LENGTH) // output length: 32 bytes
+    ).map_err(|e| anyhow::anyhow!("Failed to create Argon2 params: {}", e))?;
+    
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let salt_string = SaltString::encode_b64(salt)
         .map_err(|e| anyhow::anyhow!("Failed to encode salt: {}", e))?;
+    
+    println!("Deriving encryption key with Argon2id (128MB, 8 iterations, 4 threads)...");
+    let start_time = Instant::now();
     
     let password_hash = argon2
         .hash_password(password.as_bytes(), &salt_string)
         .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
+    
+    let duration = start_time.elapsed();
+    println!("Argon2 key derivation completed in {:.2} seconds", duration.as_secs_f64());
     
     let hash = password_hash.hash
         .context("No hash in password hash")?;
@@ -229,9 +225,25 @@ fn unzip_to_directory(zip_data: &[u8], output_dir: &Path) -> Result<()> {
 fn encrypt_file(file_path: &str, password: &str) -> Result<()> {
     let path = Path::new(file_path);
     
+    // Generate random salt and nonce first
+    let mut salt = [0u8; SALT_LENGTH];
+    let mut nonce_bytes = [0u8; NONCE_LENGTH];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut nonce_bytes);
+    
+    // Derive encryption key from password and salt (this is the slow step)
+    let key = derive_key(password, &salt)?;
+    
+    // Create cipher
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
+    
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    
+    // Now do the progress-tracked operations
     // Determine what we're encrypting
     let (input_data, is_directory) = if path.is_dir() {
-        println!("Zipping directory before encryption...");
+        println!("Zipping directory...");
         let zip_data = zip_directory(path)?;
         (zip_data, true)
     } else {
@@ -241,22 +253,8 @@ fn encrypt_file(file_path: &str, password: &str) -> Result<()> {
         (file_data, false)
     };
     
-    // Generate random salt and nonce
-    let mut salt = [0u8; SALT_LENGTH];
-    let mut nonce_bytes = [0u8; NONCE_LENGTH];
-    OsRng.fill_bytes(&mut salt);
-    OsRng.fill_bytes(&mut nonce_bytes);
-    
-    // Derive encryption key from password and salt
-    let key = derive_key(password, &salt)?;
-    
-    // Create cipher
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
-    
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    
     // Encrypt the data
+    println!("Encrypting data...");
     let ciphertext = cipher.encrypt(nonce, input_data.as_ref())
         .map_err(|e| anyhow::anyhow!("Failed to encrypt data: {}", e))?;
     
@@ -271,12 +269,32 @@ fn encrypt_file(file_path: &str, password: &str) -> Result<()> {
     output_data.extend_from_slice(&nonce_bytes);
     output_data.extend_from_slice(&ciphertext);
     
-    // Write to .aes file
+    // Write to .aes file with progress
     // Remove trailing path separators before adding .aes extension
     let clean_path = file_path.trim_end_matches('/').trim_end_matches('\\');
     let output_path = format!("{}.aes", clean_path);
-    fs::write(&output_path, output_data)
-        .with_context(|| format!("Failed to write encrypted file: {}", output_path))?;
+    
+    println!("Writing encrypted file...");
+    let write_pb = ProgressBar::new(output_data.len() as u64);
+    write_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} Writing [{elapsed_precise}] [{bar:40.yellow/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    
+    // Write in chunks to show progress
+    let mut output_file = fs::File::create(&output_path)
+        .with_context(|| format!("Failed to create encrypted file: {}", output_path))?;
+    
+    const WRITE_CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+    for chunk in output_data.chunks(WRITE_CHUNK_SIZE) {
+        output_file.write_all(chunk)
+            .context("Failed to write encrypted data")?;
+        write_pb.inc(chunk.len() as u64);
+    }
+    
+    write_pb.finish_with_message("Writing complete");
     
     if is_directory {
         println!("Directory zipped and encrypted successfully: {}", output_path);
@@ -296,7 +314,7 @@ fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
     let encrypted_data = fs::read(file_path)
         .with_context(|| format!("Failed to read encrypted file: {}", file_path))?;
     
-    // Check minimum file size (flag + salt + nonce + at least some ciphertext)
+    // Check minimum file size (directory flag + salt + nonce + at least some ciphertext)
     if encrypted_data.len() < 1 + SALT_LENGTH + NONCE_LENGTH + 16 {
         bail!("Invalid encrypted file format");
     }
@@ -317,8 +335,20 @@ fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
     let nonce = Nonce::from_slice(nonce_bytes);
     
     // Decrypt the data
+    println!("Decrypting data...");
+    let decrypt_pb = ProgressBar::new(ciphertext.len() as u64);
+    decrypt_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} Decrypting [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    
     let plaintext = cipher.decrypt(nonce, ciphertext)
         .map_err(|e| anyhow::anyhow!("Failed to decrypt data - incorrect password or corrupted file: {}", e))?;
+    
+    decrypt_pb.inc(ciphertext.len() as u64);
+    decrypt_pb.finish_with_message("Decryption complete");
     
     // Determine output path (remove .aes extension)
     let output_path = &file_path[..file_path.len() - 4];
@@ -344,9 +374,27 @@ fn decrypt_file(file_path: &str, password: &str) -> Result<()> {
             bail!("Output file already exists: {}", output_path);
         }
         
-        // Write decrypted data
-        fs::write(output_path, plaintext)
-            .with_context(|| format!("Failed to write decrypted file: {}", output_path))?;
+        // Write decrypted data with progress
+        println!("Writing decrypted file...");
+        let write_pb = ProgressBar::new(plaintext.len() as u64);
+        write_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} Writing [{elapsed_precise}] [{bar:40.yellow/red}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        
+        let mut output_file = fs::File::create(output_path)
+            .with_context(|| format!("Failed to create decrypted file: {}", output_path))?;
+        
+        const WRITE_CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks
+        for chunk in plaintext.chunks(WRITE_CHUNK_SIZE) {
+            output_file.write_all(chunk)
+                .context("Failed to write decrypted data")?;
+            write_pb.inc(chunk.len() as u64);
+        }
+        
+        write_pb.finish_with_message("Writing complete");
         
         println!("File decrypted successfully: {}", output_path);
     }
@@ -413,30 +461,9 @@ fn list_current_directory() -> Result<()> {
 fn interactive_mode() -> Result<()> {
     println!("=== AESify Interactive Mode ===\n");
     
-    // Ask for operation
-    loop {
-        let operation = prompt_user("Do you want to (e)ncrypt or (d)ecrypt a file? [e/d]: ")?;
-        let operation = operation.to_lowercase();
-        
-        match operation.as_str() {
-            "e" | "encrypt" => {
-                return interactive_encrypt();
-            },
-            "d" | "decrypt" => {
-                return interactive_decrypt();
-            },
-            _ => {
-                println!("Please enter 'e' for encrypt or 'd' for decrypt.");
-                continue;
-            }
-        }
-    }
-}
-
-fn interactive_encrypt() -> Result<()> {
     // Get file path
     let file_path = loop {
-        let path = prompt_user("Enter the file or directory path to encrypt (type 'ls' to list files): ")?;
+        let path = prompt_user("Enter the file or directory path (type 'ls' to list files): ")?;
         if path.is_empty() {
             println!("Path cannot be empty.");
             continue;
@@ -452,67 +479,46 @@ fn interactive_encrypt() -> Result<()> {
         break path;
     };
     
+    // Determine operation based on file extension
+    let is_decrypt = file_path.ends_with(".aes");
+    
+    if is_decrypt {
+        println!("Detected .aes file - will decrypt");
+    } else {
+        println!("Detected non-.aes file - will encrypt");
+    }
+    
     // Get password
     let password = loop {
-        let pass = get_password("Enter password for encryption: ")?;
+        let pass = get_password(&format!("Enter password for {}: ", if is_decrypt { "decryption" } else { "encryption" }))?;
         if pass.is_empty() {
             println!("Password cannot be empty.");
             continue;
         }
-        if pass.len() < 4 {
-            println!("Password should be at least 4 characters long for security.");
-            continue;
-        }
-        
-        let confirm = get_password("Confirm password: ")?;
-        if pass != confirm {
-            println!("Passwords do not match. Please try again.");
-            continue;
-        }
-        break pass;
-    };
-    
-    println!("\nEncrypting file...");
-    encrypt_file(&file_path, &password)?;
-    
-    Ok(())
-}
-
-fn interactive_decrypt() -> Result<()> {
-    // Get file path
-    let file_path = loop {
-        let path = prompt_user("Enter the .aes file path to decrypt (type 'ls' to list files): ")?;
-        if path.is_empty() {
-            println!("File path cannot be empty.");
-            continue;
-        }
-        if path.to_lowercase() == "ls" || path.to_lowercase() == "dir" {
-            list_current_directory()?;
-            continue;
-        }
-        if !path.ends_with(".aes") {
-            println!("File must have .aes extension.");
-            continue;
-        }
-        if !Path::new(&path).exists() {
-            println!("File '{}' does not exist. Please check the path.", path);
-            continue;
-        }
-        break path;
-    };
-    
-    // Get password
-    let password = loop {
-        let pass = get_password("Enter password for decryption: ")?;
-        if pass.is_empty() {
-            println!("Password cannot be empty.");
-            continue;
+        if !is_decrypt {
+            // Only require password confirmation for encryption
+            if pass.len() < 4 {
+                println!("Password should be at least 4 characters long for security.");
+                continue;
+            }
+            
+            let confirm = get_password("Confirm password: ")?;
+            if pass != confirm {
+                println!("Passwords do not match. Please try again.");
+                continue;
+            }
         }
         break pass;
     };
     
-    println!("\nDecrypting file...");
-    decrypt_file(&file_path, &password)?;
+    // Perform the operation
+    if is_decrypt {
+        println!("\nDecrypting file...");
+        decrypt_file(&file_path, &password)?;
+    } else {
+        println!("\nEncrypting file...");
+        encrypt_file(&file_path, &password)?;
+    }
     
     Ok(())
 }
@@ -520,21 +526,24 @@ fn interactive_decrypt() -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
-    match &cli.command {
-        Some(Commands::Encrypt { file, password }) => {
-            if !Path::new(file).exists() {
-                bail!("Input file or directory does not exist: {}", file);
-            }
-            encrypt_file(file, password)?;
-        },
-        Some(Commands::Decrypt { file, password }) => {
-            if !Path::new(file).exists() {
+    match (cli.file, cli.password) {
+        (Some(file), Some(password)) => {
+            // Check if file exists
+            if !Path::new(&file).exists() {
                 bail!("Input file does not exist: {}", file);
             }
-            decrypt_file(file, password)?;
+            
+            // Infer operation based on file extension
+            if file.ends_with(".aes") {
+                println!("Detected .aes file - decrypting...");
+                decrypt_file(&file, &password)?;
+            } else {
+                println!("Detected non-.aes file - encrypting...");
+                encrypt_file(&file, &password)?;
+            }
         },
-        None => {
-            // No command provided, start interactive mode
+        _ => {
+            // No arguments provided, start interactive mode
             interactive_mode()?;
         }
     }
