@@ -984,4 +984,108 @@ mod tests {
         let result = encrypt_data_chunked(&algorithm, &key, &base_nonce, test_data, chunk_size);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_compute_hmac_consistency() {
+        let salt = create_test_salt();
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        // Same data should produce same HMAC
+        let hmac1 = compute_hmac(TEST_DATA, &key, &salt).unwrap();
+        let hmac2 = compute_hmac(TEST_DATA, &key, &salt).unwrap();
+        assert_eq!(hmac1, hmac2);
+        
+        // HMAC should be 32 bytes (SHA256)
+        assert_eq!(hmac1.len(), 32);
+        
+        // Different data should produce different HMAC
+        let different_data = b"Different test data";
+        let hmac3 = compute_hmac(different_data, &key, &salt).unwrap();
+        assert_ne!(hmac1, hmac3);
+    }
+
+    #[test]
+    fn test_verify_hmac_success() {
+        let salt = create_test_salt();
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        // Compute HMAC
+        let hmac = compute_hmac(TEST_DATA, &key, &salt).unwrap();
+        
+        // Verify should succeed with correct HMAC
+        assert!(verify_hmac(TEST_DATA, &key, &salt, &hmac).unwrap());
+    }
+
+    #[test]
+    fn test_verify_hmac_failure() {
+        let salt = create_test_salt();
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        // Compute HMAC for original data
+        let hmac = compute_hmac(TEST_DATA, &key, &salt).unwrap();
+        
+        // Verify should fail with wrong data
+        let wrong_data = b"Wrong test data";
+        assert!(!verify_hmac(wrong_data, &key, &salt, &hmac).unwrap());
+        
+        // Verify should fail with wrong HMAC
+        let mut wrong_hmac = hmac.clone();
+        wrong_hmac[0] ^= 0x01; // Flip a bit
+        assert!(!verify_hmac(TEST_DATA, &key, &salt, &wrong_hmac).unwrap());
+        
+        // Verify should fail with different key
+        let different_salt = [2u8; SALT_LENGTH];
+        let different_key = derive_key(TEST_PASSWORD, &different_salt, &params).unwrap();
+        assert!(!verify_hmac(TEST_DATA, &different_key, &salt, &hmac).unwrap());
+    }
+
+    #[test]
+    fn test_hmac_with_different_salts() {
+        let salt1 = create_test_salt();
+        let salt2 = [2u8; SALT_LENGTH]; // Different salt
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt1, &params).unwrap();
+        
+        // Same key but different salts should produce different HMACs
+        let hmac1 = compute_hmac(TEST_DATA, &key, &salt1).unwrap();
+        let hmac2 = compute_hmac(TEST_DATA, &key, &salt2).unwrap();
+        assert_ne!(hmac1, hmac2);
+        
+        // Verify with wrong salt should fail
+        assert!(!verify_hmac(TEST_DATA, &key, &salt2, &hmac1).unwrap());
+    }
+
+    #[test]
+    fn test_hmac_empty_data() {
+        let salt = create_test_salt();
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        // HMAC of empty data should work
+        let empty_data = b"";
+        let hmac = compute_hmac(empty_data, &key, &salt).unwrap();
+        assert_eq!(hmac.len(), 32);
+        assert!(verify_hmac(empty_data, &key, &salt, &hmac).unwrap());
+    }
+
+    #[test]
+    fn test_hmac_large_data() {
+        let salt = create_test_salt();
+        let params = create_fast_test_params();
+        let key = derive_key(TEST_PASSWORD, &salt, &params).unwrap();
+        
+        // Test with large data (1MB)
+        let large_data = vec![0x42u8; 1024 * 1024];
+        let hmac = compute_hmac(&large_data, &key, &salt).unwrap();
+        assert_eq!(hmac.len(), 32);
+        assert!(verify_hmac(&large_data, &key, &salt, &hmac).unwrap());
+        
+        // Modify one byte and verify it fails
+        let mut modified_data = large_data.clone();
+        modified_data[512 * 1024] ^= 0x01; // Flip a bit in the middle
+        assert!(!verify_hmac(&modified_data, &key, &salt, &hmac).unwrap());
+    }
 }
