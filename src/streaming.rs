@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::path::Path;
-use std::io::{Write, BufWriter};
+use std::io::{Read, Write, BufReader, BufWriter, Seek};
 use anyhow::{Result, Context, bail};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -9,7 +9,7 @@ use zstd;
 
 use crate::crypto::*;
 use crate::progress::*;
-use crate::tar_operations::{count_files_in_directory, stream_tar_directory_recursive, extract_tar_to_directory, extract_single_file_from_tar};
+use crate::tar_operations::{count_files_in_directory, stream_tar_directory_recursive};
 
 /// Size of the read buffer for streaming operations
 const STREAM_BUFFER_SIZE: usize = 64 * 1024; // 64KB
@@ -237,6 +237,200 @@ impl<W: Write> Write for StreamingEncryptionWriter<W> {
     }
 }
 
+/// A streaming decryption reader that decrypts data as it's read
+pub struct StreamingDecryptionReader<R: Read> {
+    inner: R,
+    algorithm: EncryptionAlgorithm,
+    key: [u8; KEY_LENGTH],
+    base_nonce: Vec<u8>,
+    chunk_counter: u64,
+    chunk_size: usize,
+    buffer: Vec<u8>,
+    buffer_pos: usize,
+    hmac: Hmac<Sha256>,
+    hmac_buffer: Vec<u8>,
+    total_read: u64,
+    file_size: u64,
+    finished: bool,
+}
+
+/// A progress-tracking wrapper for Read that updates a progress bar
+pub struct ProgressTrackingReader<R: Read> {
+    inner: R,
+    progress_bar: indicatif::ProgressBar,
+    bytes_read: u64,
+}
+
+impl<R: Read> ProgressTrackingReader<R> {
+    pub fn new(inner: R, progress_bar: indicatif::ProgressBar) -> Self {
+        Self {
+            inner,
+            progress_bar,
+            bytes_read: 0,
+        }
+    }
+    
+    pub fn finish(self) -> R {
+        // Don't finish the progress bar here - let the caller manage it
+        self.inner
+    }
+}
+
+impl<R: Read> Read for ProgressTrackingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let bytes_read = self.inner.read(buf)?;
+        self.bytes_read += bytes_read as u64;
+        self.progress_bar.set_position(self.bytes_read);
+        Ok(bytes_read)
+    }
+}
+
+impl<R: Read> StreamingDecryptionReader<R> {
+    pub fn new(
+        inner: R,
+        algorithm: EncryptionAlgorithm,
+        key: [u8; KEY_LENGTH],
+        base_nonce: Vec<u8>,
+        salt: &[u8],
+        file_size: u64,
+    ) -> Result<Self> {
+        let chunk_size = DEFAULT_CHUNK_SIZE;
+        
+        // Create HMAC for integrity
+        let mut hmac_key = Vec::with_capacity(KEY_LENGTH + salt.len());
+        hmac_key.extend_from_slice(&key);
+        hmac_key.extend_from_slice(salt);
+        let hmac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
+            .map_err(|e| anyhow::anyhow!("Failed to create HMAC: {}", e))?;
+        
+        Ok(Self {
+            inner,
+            algorithm,
+            key,
+            base_nonce,
+            chunk_counter: 0,
+            chunk_size,
+            buffer: Vec::new(),
+            buffer_pos: 0,
+            hmac,
+            hmac_buffer: Vec::new(),
+            total_read: 0,
+            file_size: file_size.saturating_sub(HMAC_SIZE as u64), // Subtract HMAC size
+            finished: false,
+        })
+    }
+    
+    fn decrypt_next_chunk(&mut self) -> Result<bool> {
+        if self.finished || self.total_read >= self.file_size {
+            return Ok(false);
+        }
+        
+        // Read next encrypted chunk
+        let mut encrypted_chunk = vec![0u8; self.chunk_size];
+        let bytes_to_read = (self.file_size - self.total_read).min(self.chunk_size as u64) as usize;
+        encrypted_chunk.resize(bytes_to_read, 0);
+        
+        let mut bytes_read = 0;
+        while bytes_read < bytes_to_read {
+            match self.inner.read(&mut encrypted_chunk[bytes_read..]) {
+                Ok(0) => break, // EOF
+                Ok(n) => bytes_read += n,
+                Err(e) => return Err(anyhow::anyhow!("Failed to read encrypted chunk: {}", e)),
+            }
+        }
+        
+        if bytes_read == 0 {
+            self.finished = true;
+            return Ok(false);
+        }
+        
+        encrypted_chunk.truncate(bytes_read);
+        self.total_read += bytes_read as u64;
+        
+        // Create chunk nonce
+        let chunk_nonce = create_streaming_chunk_nonce(&self.algorithm, &self.base_nonce, self.chunk_counter)?;
+        
+        // Decrypt the chunk
+        let plaintext = decrypt_data(&self.algorithm, &self.key, &chunk_nonce, &encrypted_chunk)?;
+        
+        // Update HMAC with plaintext
+        self.hmac.update(&plaintext);
+        
+        // Store decrypted data in buffer
+        self.buffer = plaintext;
+        self.buffer_pos = 0;
+        self.chunk_counter += 1;
+        
+        Ok(true)
+    }
+    
+    pub fn verify_hmac(&mut self, expected_hmac: &[u8]) -> Result<bool> {
+        // Read any remaining HMAC bytes if we haven't finished reading the file
+        if !self.finished && self.total_read < self.file_size {
+            // Read and discard remaining ciphertext
+            let mut temp_buffer = vec![0u8; 4096];
+            while self.total_read < self.file_size {
+                match self.inner.read(&mut temp_buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let bytes_to_process = (self.file_size - self.total_read).min(n as u64) as usize;
+                        self.total_read += bytes_to_process as u64;
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("Failed to read remaining data: {}", e)),
+                }
+            }
+        }
+        
+        // Read HMAC from end of file
+        self.hmac_buffer.resize(HMAC_SIZE, 0);
+        let mut hmac_bytes_read = 0;
+        while hmac_bytes_read < HMAC_SIZE {
+            match self.inner.read(&mut self.hmac_buffer[hmac_bytes_read..]) {
+                Ok(0) => break,
+                Ok(n) => hmac_bytes_read += n,
+                Err(e) => return Err(anyhow::anyhow!("Failed to read HMAC: {}", e)),
+            }
+        }
+        
+        if hmac_bytes_read != HMAC_SIZE {
+            return Err(anyhow::anyhow!("Incomplete HMAC read: expected {} bytes, got {}", HMAC_SIZE, hmac_bytes_read));
+        }
+        
+        // Verify HMAC
+        let computed_hmac = self.hmac.clone().finalize().into_bytes();
+        Ok(computed_hmac.as_slice() == expected_hmac)
+    }
+}
+
+impl<R: Read> Read for StreamingDecryptionReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.finished {
+            return Ok(0);
+        }
+        
+        // If buffer is empty or exhausted, decrypt next chunk
+        if self.buffer_pos >= self.buffer.len() {
+            match self.decrypt_next_chunk() {
+                Ok(true) => {}, // Successfully decrypted a chunk
+                Ok(false) => {
+                    self.finished = true;
+                    return Ok(0); // EOF
+                },
+                Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            }
+        }
+        
+        // Copy data from buffer to output
+        let bytes_available = self.buffer.len() - self.buffer_pos;
+        let bytes_to_copy = buf.len().min(bytes_available);
+        
+        buf[..bytes_to_copy].copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + bytes_to_copy]);
+        self.buffer_pos += bytes_to_copy;
+        
+        Ok(bytes_to_copy)
+    }
+}
+
 /// Create a chunk nonce for streaming encryption/decryption
 fn create_streaming_chunk_nonce(algorithm: &EncryptionAlgorithm, base_nonce: &[u8], chunk_counter: u64) -> Result<Vec<u8>> {
     let nonce_length = algorithm.nonce_length();
@@ -415,74 +609,38 @@ fn display_decryption_info(header: &crate::crypto::EncryptionHeader) {
     println!("Chunked encryption: {}KB chunks", header.chunk_size / 1024);
 }
 
-/// Helper function to extract single file from TAR
-fn extract_single_file(final_data: &[u8], output_path: &str) -> Result<()> {
-    extract_single_file_from_tar(final_data, output_path)?;
-    Ok(())
-}
-
-/// Helper function to extract directory from TAR
-fn extract_directory(final_data: &[u8], output_path: &str) -> Result<()> {
-    if Path::new(output_path).exists() {
-        bail!("Output directory already exists: {}", output_path);
-    }
-    
-    fs::create_dir_all(output_path)
-        .with_context(|| format!("Failed to create output directory: {}", output_path))?;
-    
-    println!("Extracting TAR directory...");
-    extract_tar_to_directory(final_data, Path::new(output_path))?;
-    
-    println!("Directory decrypted and extracted successfully: {}", output_path);
-    Ok(())
-}
-
 /// Stream decrypt a TAR-based encrypted file, handling both single files and directories
 pub fn stream_decrypt_tar(
     input_path: &str,
     output_path: &str,
     password: &str,
 ) -> Result<()> {
-    // Read the encrypted file
-    let encrypted_data = fs::read(input_path)
-        .with_context(|| format!("Failed to read encrypted file: {}", input_path))?;
-    
-    // Check minimum file size (header length + some header + at least some ciphertext)
-    if encrypted_data.len() < 4 + 10 + 16 {
-        bail!("Invalid encrypted file format - file too small");
-    }
-    
-    // Extract CBOR header length (first 4 bytes, little-endian)
-    let header_length_bytes = [
-        encrypted_data[0], encrypted_data[1], encrypted_data[2], encrypted_data[3]
-    ];
+    // Open encrypted file and buffer for streaming
+    let file = File::open(input_path)
+        .with_context(|| format!("Failed to open encrypted file: {}", input_path))?;
+    let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
+
+    // Read CBOR header length (first 4 bytes)
+    let mut header_length_bytes = [0u8; 4];
+    reader.read_exact(&mut header_length_bytes)
+        .with_context(|| format!("Failed to read CBOR header length from: {}", input_path))?;
     let header_length = u32::from_le_bytes(header_length_bytes) as usize;
-    
-    // Validate header length with comprehensive bounds checking
+
+    // Validate header length
     if header_length == 0 {
         bail!("Invalid CBOR header: header length is zero");
-    }
-    if header_length > encrypted_data.len().saturating_sub(4) {
-        bail!("Invalid CBOR header length: {} bytes (file size: {} bytes)", 
-              header_length, encrypted_data.len());
     }
     if header_length > MAX_HEADER_SIZE {
         bail!("CBOR header too large: {} bytes (maximum: {})", header_length, MAX_HEADER_SIZE);
     }
-    
-    // Extract CBOR header and ciphertext
-    let cbor_header_data = &encrypted_data[4..4 + header_length];
-    let remaining_data = &encrypted_data[4 + header_length..];
-    
-    // Extract HMAC (last 32 bytes) and ciphertext (everything before HMAC)
-    if remaining_data.len() < HMAC_SIZE {
-        bail!("Invalid encrypted file format - missing HMAC");
-    }
-    let ciphertext = &remaining_data[..remaining_data.len() - HMAC_SIZE];
-    let stored_hmac = &remaining_data[remaining_data.len() - HMAC_SIZE..];
-    
+
+    // Read CBOR header data
+    let mut cbor_header_data = vec![0u8; header_length];
+    reader.read_exact(&mut cbor_header_data)
+        .with_context(|| "Failed to read CBOR header data")?;
+
     // Deserialize and validate header
-    let header = deserialize_header_from_cbor(cbor_header_data)?;
+    let header = deserialize_header_from_cbor(&cbor_header_data)?;
     validate_header(&header)?;
     
     // Display encryption details
@@ -501,51 +659,194 @@ pub fn stream_decrypt_tar(
     // Derive decryption key from password and salt from header
     let key = derive_key(password, &header.salt, &argon2_params)?;
     
-    // Decrypt the data using chunked decryption
+    // Get file size to calculate ciphertext size
+    let file_metadata = std::fs::metadata(input_path)
+        .with_context(|| format!("Failed to get file metadata: {}", input_path))?;
+    let total_file_size = file_metadata.len();
+    let ciphertext_size = total_file_size - 4 - header_length as u64; // Subtract header length and header data
+    
+    // Create progress bar for decryption and extraction
     println!("Decrypting data...");
-    let decrypt_pb = create_byte_progress_bar(ciphertext.len() as u64, "Decrypting");
+    let decrypt_pb = create_byte_progress_bar(ciphertext_size, "Decrypting and extracting");
     
-    let plaintext = decrypt_data_chunked(&algorithm, &key, &header.nonce, ciphertext, header.chunk_size as usize)?;
+    // Create streaming decryption reader
+    let decryption_reader = StreamingDecryptionReader::new(
+        reader,
+        algorithm.clone(),
+        key,
+        header.nonce.clone(),
+        &header.salt,
+        ciphertext_size,
+    )?;
     
-    decrypt_pb.inc(ciphertext.len() as u64);
-    decrypt_pb.finish_with_message("Decryption complete");
+    // Wrap with progress tracking
+    let progress_reader = ProgressTrackingReader::new(decryption_reader, decrypt_pb.clone());
     
-    // Verify HMAC for file integrity
-    println!("Verifying file integrity...");
-    if !verify_hmac(&plaintext, &key, &header.salt, stored_hmac)? {
-        bail!("File integrity verification failed - file may be corrupted or tampered with");
-    }
-    println!("File integrity verified successfully");
-    
-    // Decompress data if compression was used
-    let final_data = if let Some(ref compression) = header.compression {
+    // Create decompression reader if needed
+    let decompressed_reader: Box<dyn Read> = if let Some(ref compression) = header.compression {
         let compression_alg = CompressionAlgorithm::from_string(&compression.algorithm)?;
         match compression_alg {
-            CompressionAlgorithm::None => plaintext,
+            CompressionAlgorithm::None => Box::new(progress_reader),
             CompressionAlgorithm::Zstd => {
-                println!("Decompressing data with zstd...");
-                zstd::decode_all(&plaintext[..])
-                    .context("Failed to decompress data with zstd")?
+                println!("Setting up streaming decompression with zstd...");
+                Box::new(zstd::Decoder::new(progress_reader)
+                    .context("Failed to create zstd decoder")?)
             }
         }
     } else {
-        plaintext
+        Box::new(progress_reader)
     };
     
-    // Extract TAR archive and determine if it's a single file or directory
-    let tar_cursor = std::io::Cursor::new(&final_data);
-    let mut tar_archive = tar::Archive::new(tar_cursor);
-    let entries: Result<Vec<_>, _> = tar_archive.entries()?.collect();
-    let entries = entries.context("Failed to read TAR entries")?;
+    // Create TAR archive from the streaming reader and extract directly
+    println!("Setting up streaming TAR extraction...");
+    let mut tar_archive = tar::Archive::new(decompressed_reader);
     
-    if entries.len() == 1 {
-        // Single file in TAR - extract to the output path directly
-        extract_single_file(&final_data, output_path)?;
-    } else {
-        // Multiple files/directories - extract to directory
-        extract_directory(&final_data, output_path)?;
+    // Try to extract as a directory first
+    println!("Decrypting and extracting data...");
+    
+    // Check if output already exists
+    if Path::new(output_path).exists() {
+        bail!("Output path already exists: {}", output_path);
     }
     
+    // Get TAR entries to determine extraction strategy
+    let entries = tar_archive.entries()
+        .context("Failed to read TAR entries")?;
+    
+    // Collect first few entries to determine if it's a single file
+    let mut entry_count = 0;
+    
+    for entry in entries {
+        let _entry = entry.context("Failed to read TAR entry")?;
+        entry_count += 1;
+        
+        // If we have more than 1 entry, treat as directory
+        if entry_count > 1 {
+            break;
+        }
+    }
+    
+    // We need to create a new reader since we consumed the first one
+    let file2 = File::open(input_path)
+        .with_context(|| format!("Failed to reopen encrypted file: {}", input_path))?;
+    let mut reader2 = BufReader::with_capacity(STREAM_BUFFER_SIZE, file2);
+    
+    // Skip header again
+    reader2.read_exact(&mut [0u8; 4])?; // header length
+    let mut cbor_skip = vec![0u8; header_length];
+    reader2.read_exact(&mut cbor_skip)?;
+    
+    let decryption_reader2 = StreamingDecryptionReader::new(
+        reader2,
+        algorithm,
+        key,
+        header.nonce.clone(),
+        &header.salt,
+        ciphertext_size,
+    )?;
+    
+    // Wrap with progress tracking using the same progress bar
+    let progress_reader2 = ProgressTrackingReader::new(decryption_reader2, decrypt_pb.clone());
+    
+    let final_reader: Box<dyn Read> = if let Some(ref compression) = header.compression {
+        let compression_alg = CompressionAlgorithm::from_string(&compression.algorithm)?;
+        match compression_alg {
+            CompressionAlgorithm::None => Box::new(progress_reader2),
+            CompressionAlgorithm::Zstd => {
+                Box::new(zstd::Decoder::new(progress_reader2)
+                    .context("Failed to create zstd decoder")?)
+            }
+        }
+    } else {
+        Box::new(progress_reader2)
+    };
+    
+    let mut tar_archive2 = tar::Archive::new(final_reader);
+    
+    if entry_count == 1 {
+        // Single file in TAR - extract to the output path directly
+        println!("Extracting single file to: {}", output_path);
+        let mut entries = tar_archive2.entries()?;
+        if let Some(entry) = entries.next() {
+            let mut entry = entry.context("Failed to read TAR entry")?;
+            let mut output_file = File::create(output_path)
+                .with_context(|| format!("Failed to create output file: {}", output_path))?;
+            
+            std::io::copy(&mut entry, &mut output_file)
+                .context("Failed to extract file from TAR")?;
+            
+            println!("File extracted successfully: {}", output_path);
+        } else {
+            bail!("TAR archive is empty");
+        }
+    } else {
+        
+        fs::create_dir_all(output_path)
+            .with_context(|| format!("Failed to create output directory: {}", output_path))?;
+        
+        tar_archive2.unpack(output_path)
+            .with_context(|| format!("Failed to extract TAR archive to: {}", output_path))?;
+        
+    }
+    
+    // Complete the progress bar
+    decrypt_pb.finish_with_message("Decryption and extraction complete");
+    
+    // Verify HMAC for file integrity after extraction is complete
+    // We need to read the HMAC from the end of the file since the streaming reader
+    // consumed all the ciphertext but hasn't verified the HMAC yet
+    println!("Verifying file integrity...");
+    
+    // Read HMAC from the end of the original file
+    let mut hmac_file = File::open(input_path)
+        .with_context(|| format!("Failed to reopen file for HMAC verification: {}", input_path))?;
+    
+    // Seek to HMAC position (last 32 bytes)
+    hmac_file.seek(std::io::SeekFrom::End(-(HMAC_SIZE as i64)))
+        .context("Failed to seek to HMAC position")?;
+    
+    let mut stored_hmac = vec![0u8; HMAC_SIZE];
+    hmac_file.read_exact(&mut stored_hmac)
+        .context("Failed to read stored HMAC")?;
+    
+    // Compute expected HMAC by re-reading and decrypting the entire file
+    // This is necessary because we need to verify the HMAC against the plaintext
+    let verification_file = File::open(input_path)
+        .with_context(|| format!("Failed to open file for HMAC verification: {}", input_path))?;
+    let mut verification_reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, verification_file);
+    
+    // Skip header
+    verification_reader.read_exact(&mut [0u8; 4])?; // header length
+    let mut cbor_skip = vec![0u8; header_length];
+    verification_reader.read_exact(&mut cbor_skip)?;
+    
+    // Create decryption reader for HMAC verification
+    let verification_algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
+    let mut hmac_verification_reader = StreamingDecryptionReader::new(
+        verification_reader,
+        verification_algorithm,
+        key,
+        header.nonce,
+        &header.salt,
+        ciphertext_size,
+    )?;
+    
+    // Read all plaintext to build HMAC (this is memory-efficient as it streams)
+    let mut temp_buffer = vec![0u8; 64 * 1024]; // 64KB buffer
+    loop {
+        match hmac_verification_reader.read(&mut temp_buffer) {
+            Ok(0) => break, // EOF
+            Ok(_) => continue, // Keep reading to build HMAC
+            Err(e) => return Err(anyhow::anyhow!("Failed to read for HMAC verification: {}", e)),
+        }
+    }
+    
+    // Now verify the HMAC
+    if !hmac_verification_reader.verify_hmac(&stored_hmac)? {
+        bail!("File integrity verification failed - file may be corrupted or tampered with");
+    }
+    
+    println!("File integrity verified successfully");
     Ok(())
 }
 
