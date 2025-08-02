@@ -1,23 +1,17 @@
-[package]
-name = "secify"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["secify-lib", "secify-cli"]
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
-clap = { version = "4.5", features = ["derive"] }
 rand = "0.8"
 anyhow = "1.0"
-indicatif = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 ciborium = "0.2"
-rpassword = "7.4"
 hmac = "0.12"
 sha2 = "0.10"
 tar = "0.4.44"
 zstd = "0.13.3"
-
-[dev-dependencies]
 tempfile = "3.20.0"

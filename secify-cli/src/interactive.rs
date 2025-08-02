@@ -3,9 +3,9 @@ use std::path::Path;
 use std::io::{self, Write};
 use anyhow::{Result, Context, bail};
 
-use crate::crypto::{EncryptionAlgorithm, Argon2Params, CompressionAlgorithm, CompressionConfig};
+use secify_lib::{EncryptionAlgorithm, Argon2Params, CompressionAlgorithm, CompressionConfig};
 use crate::cli::{DEFAULT_ALGORITHM, MIN_PASSWORD_LENGTH};
-use crate::file_operations::{encrypt_file_with_compression, decrypt_file};
+use crate::progress::{encrypt_with_ui, decrypt_with_ui};
 
 pub fn prompt_user(prompt: &str) -> Result<String> {
     print!("{prompt}");
@@ -69,11 +69,6 @@ pub fn list_current_directory() -> Result<()> {
     println!();
     
     Ok(())
-}
-
-pub fn interactive_mode() -> Result<()> {
-    let default_params = Argon2Params::default();
-    interactive_mode_with_params(default_params)
 }
 
 pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<()> {
@@ -278,10 +273,15 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
     // Perform the operation
     if is_decrypt {
         println!("\nDecrypting file...");
-        decrypt_file(&file_path, &password)?;
+        // Determine output path (remove .sec extension)
+        let output_path = &file_path[..file_path.len() - 4];
+        decrypt_with_ui(&file_path, output_path, &password)?;
     } else {
         println!("\nEncrypting file...");
-        encrypt_file_with_compression(&file_path, &password, &algorithm, &argon2_params, compression_config)?;
+        // Create output path
+        let clean_path = file_path.trim_end_matches('/').trim_end_matches('\\');
+        let output_path = format!("{clean_path}.sec");
+        encrypt_with_ui(&file_path, &output_path, &password, &algorithm, &argon2_params, compression_config)?;
     }
     
     Ok(())

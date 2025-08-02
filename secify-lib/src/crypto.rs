@@ -204,6 +204,10 @@ pub fn generate_secure_random_bytes(buffer: &mut [u8]) -> Result<()> {
 }
 
 pub fn derive_key(password: &str, salt: &[u8], argon2_params: &Argon2Params) -> Result<[u8; KEY_LENGTH]> {
+    derive_key_with_callback(password, salt, argon2_params, &|_| {})
+}
+
+pub fn derive_key_with_callback(password: &str, salt: &[u8], argon2_params: &Argon2Params, log_callback: &dyn Fn(&str)) -> Result<[u8; KEY_LENGTH]> {
     // Explicit Argon2id parameters for security and transparency
     let params = Params::new(
         argon2_params.memory_kb(), // memory cost in KB
@@ -216,8 +220,8 @@ pub fn derive_key(password: &str, salt: &[u8], argon2_params: &Argon2Params) -> 
     let salt_string = SaltString::encode_b64(salt)
         .map_err(|e| anyhow::anyhow!("Failed to encode salt: {}", e))?;
     
-    println!("Deriving encryption key with Argon2id ({}MB, {} iterations, {} threads)...", 
-             argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
+    log_callback(&format!("Deriving encryption key with Argon2id ({}MB, {} iterations, {} threads)...", 
+             argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism));
     let start_time = Instant::now();
     
     let password_hash = argon2
@@ -225,7 +229,7 @@ pub fn derive_key(password: &str, salt: &[u8], argon2_params: &Argon2Params) -> 
         .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
     
     let duration = start_time.elapsed();
-    println!("Argon2 key derivation completed in {:.2} seconds", duration.as_secs_f64());
+    log_callback(&format!("Argon2 key derivation completed in {:.2} seconds", duration.as_secs_f64()));
     
     let hash = password_hash.hash
         .context("No hash in password hash")?;

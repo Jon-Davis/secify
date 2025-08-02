@@ -1,8 +1,21 @@
 use clap::Parser;
-use crate::crypto::{EncryptionAlgorithm, parse_algorithm, CompressionAlgorithm};
+use secify_lib::{EncryptionAlgorithm, CompressionAlgorithm};
+
+fn parse_algorithm(s: &str) -> Result<EncryptionAlgorithm, String> {
+    match s.to_lowercase().as_str() {
+        "aes256" | "aes" | "aes-256-gcm" => Ok(EncryptionAlgorithm::Aes256Gcm),
+        "chacha20" | "chacha" | "chacha20-poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
+        "xchacha20" | "xchacha" | "xchacha20-poly1305" => Ok(EncryptionAlgorithm::XChaCha20Poly1305),
+        _ => Err(format!("Unsupported encryption algorithm: {}. Valid options: aes256, chacha20, xchacha20", s)),
+    }
+}
 
 fn parse_compression_algorithm(s: &str) -> Result<CompressionAlgorithm, String> {
-    CompressionAlgorithm::from_string(s).map_err(|e| e.to_string())
+    match s.to_lowercase().as_str() {
+        "none" => Ok(CompressionAlgorithm::None),
+        "zstd" | "zstandard" => Ok(CompressionAlgorithm::Zstd),
+        _ => Err(format!("Invalid compression algorithm '{s}'. Valid options: none, zstd")),
+    }
 }
 
 #[derive(Parser)]

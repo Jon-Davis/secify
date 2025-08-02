@@ -1,0 +1,22 @@
+[package]
+name = "secify-lib"
+version = "0.1.0"
+edition = "2021"
+description = "Core encryption/decryption library for .sec files"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

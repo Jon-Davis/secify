@@ -681,7 +681,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "secify"
+name = "secify-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "indicatif",
+ "rpassword",
+ "secify-lib",
+ "tempfile",
+]
+
+[[package]]
+name = "secify-lib"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -689,11 +701,8 @@ dependencies = [
  "argon2",
  "chacha20poly1305",
  "ciborium",
- "clap",
  "hmac",
- "indicatif",
  "rand",
- "rpassword",
  "serde",
  "sha2",
  "tar",
