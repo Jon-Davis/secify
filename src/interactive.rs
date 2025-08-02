@@ -3,9 +3,9 @@ use std::path::Path;
 use std::io::{self, Write};
 use anyhow::{Result, Context, bail};
 
-use crate::crypto::{EncryptionAlgorithm, Argon2Params};
+use crate::crypto::{EncryptionAlgorithm, Argon2Params, CompressionAlgorithm, CompressionConfig};
 use crate::cli::{DEFAULT_ALGORITHM, MIN_PASSWORD_LENGTH};
-use crate::file_operations::{encrypt_file, decrypt_file};
+use crate::file_operations::{encrypt_file_with_compression, decrypt_file};
 
 pub fn prompt_user(prompt: &str) -> Result<String> {
     print!("{prompt}");
@@ -199,6 +199,46 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
         }
     }
     
+    // Get compression settings (only for encryption)
+    let compression_config = if !is_decrypt {
+        println!("\nCompression Settings:");
+        println!("Select compression algorithm:");
+        println!("1. None (faster encryption, larger files)");
+        println!("2. Zstandard (zstd) (slower encryption, smaller files, default)");
+        
+        let compression_alg = loop {
+            let choice = prompt_user("Enter choice (1 or 2, default is 2): ")?;
+            match choice.trim() {
+                "1" => break CompressionAlgorithm::None,
+                "" | "2" => break CompressionAlgorithm::Zstd,
+                _ => println!("Invalid choice. Please enter 1 or 2."),
+            }
+        };
+        
+        if matches!(compression_alg, CompressionAlgorithm::Zstd) {
+            // Get compression level for zstd
+            let compression_level = loop {
+                let input = prompt_user("Compression level (1-22, default: 3, higher = better compression but slower): ")?;
+                if input.is_empty() {
+                    break 3; // New default level
+                }
+                match input.parse::<i32>() {
+                    Ok(level) if (1..=22).contains(&level) => break level,
+                    _ => println!("Invalid compression level. Please enter a value between 1 and 22."),
+                }
+            };
+            
+            Some(CompressionConfig {
+                algorithm: compression_alg.to_string().to_owned(),
+                level: compression_level,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
     // Get password
     let password = loop {
         let pass = get_password(&format!("Enter password for {}: ", if is_decrypt { "decryption" } else { "encryption" }))?;
@@ -241,7 +281,7 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
         decrypt_file(&file_path, &password)?;
     } else {
         println!("\nEncrypting file...");
-        encrypt_file(&file_path, &password, &algorithm, &argon2_params)?;
+        encrypt_file_with_compression(&file_path, &password, &algorithm, &argon2_params, compression_config)?;
     }
     
     Ok(())

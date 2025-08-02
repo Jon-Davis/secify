@@ -2,9 +2,19 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 use crate::crypto::*;
-use crate::streaming::{stream_encrypt_tar, stream_decrypt_tar};
+use crate::streaming::{stream_decrypt_tar, stream_encrypt_tar_with_compression};
 
 pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params) -> Result<()> {
+    encrypt_file_with_compression(file_path, password, algorithm, argon2_params, None)
+}
+
+pub fn encrypt_file_with_compression(
+    file_path: &str, 
+    password: &str, 
+    algorithm: &EncryptionAlgorithm, 
+    argon2_params: &Argon2Params,
+    compression: Option<CompressionConfig>
+) -> Result<()> {
     let path = Path::new(file_path);
     
     // Validate file/directory exists
@@ -13,12 +23,17 @@ pub fn encrypt_file(file_path: &str, password: &str, algorithm: &EncryptionAlgor
     }
     
     // Always use TAR format for both files and directories
-    println!("Using TAR archive format with full streaming pipeline (read→tar→encrypt→write)");
+    if compression.is_some() {
+        println!("Using TAR archive format with compression and full streaming pipeline (read→tar→compress→encrypt→write)");
+    } else {
+        println!("Using TAR archive format with full streaming pipeline (read→tar→encrypt→write)");
+    }
+    
     let clean_path = file_path.trim_end_matches('/').trim_end_matches('\\');
     let output_path = format!("{clean_path}.sec");
     
-    // Use streaming TAR encryption for everything
-    stream_encrypt_tar(file_path, &output_path, password, algorithm, argon2_params)
+    // Use streaming TAR encryption with optional compression
+    stream_encrypt_tar_with_compression(file_path, &output_path, password, algorithm, argon2_params, compression)
 }
 
 pub fn decrypt_file(file_path: &str, password: &str) -> Result<()> {

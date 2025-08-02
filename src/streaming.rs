@@ -5,6 +5,7 @@ use anyhow::{Result, Context, bail};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tar::Builder;
+use zstd;
 
 use crate::crypto::*;
 use crate::progress::*;
@@ -12,6 +13,118 @@ use crate::tar_operations::{count_files_in_directory, stream_tar_directory_recur
 
 /// Size of the read buffer for streaming operations
 const STREAM_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+
+/// Maximum allowed CBOR header size (1MB)
+const MAX_HEADER_SIZE: usize = 1_048_576;
+
+/// HMAC size in bytes (SHA256)
+const HMAC_SIZE: usize = 32;
+
+/// A compression wrapper that handles TAR → Compress → Buffer → Encrypt pipeline
+pub struct CompressionBufferingWriter<W: Write> {
+    inner: StreamingEncryptionWriter<W>,
+    compression_buffer: Vec<u8>,
+    compression_encoder: Option<zstd::Encoder<'static, Vec<u8>>>,
+    chunk_size: usize,
+}
+
+impl<W: Write> CompressionBufferingWriter<W> {
+    pub fn new(
+        inner: StreamingEncryptionWriter<W>,
+        compression: Option<&CompressionConfig>,
+    ) -> Result<Self> {
+        let chunk_size = DEFAULT_CHUNK_SIZE - 16; // Account for auth tag
+        
+        let compression_encoder = if let Some(config) = compression {
+            match CompressionAlgorithm::from_string(&config.algorithm)? {
+                CompressionAlgorithm::None => None,
+                CompressionAlgorithm::Zstd => {
+                    let encoder = zstd::Encoder::new(Vec::new(), config.level)?;
+                    Some(encoder)
+                }
+            }
+        } else {
+            None
+        };
+        
+        Ok(Self {
+            inner,
+            compression_buffer: Vec::new(),
+            compression_encoder,
+            chunk_size,
+        })
+    }
+    
+    /// Helper method to handle compression output and buffer management
+    fn handle_compression_output(&mut self) -> Result<()> {
+        if let Some(ref mut encoder) = self.compression_encoder {
+            let compressed_output = encoder.get_ref();
+            if !compressed_output.is_empty() {
+                self.compression_buffer.extend_from_slice(compressed_output);
+                *encoder.get_mut() = Vec::new();
+                self.flush_compressed_chunks()?;
+            }
+        }
+        Ok(())
+    }
+    
+    fn flush_compressed_chunks(&mut self) -> Result<()> {
+        // Extract full chunks from compression buffer and send to encryption
+        while self.compression_buffer.len() >= self.chunk_size {
+            let chunk = self.compression_buffer.drain(..self.chunk_size).collect::<Vec<u8>>();
+            self.inner.write_all(&chunk)?;
+        }
+        Ok(())
+    }
+    
+    pub fn finalize(mut self) -> Result<StreamingEncryptionWriter<W>> {
+        // Finalize compression if enabled
+        if let Some(encoder) = self.compression_encoder.take() {
+            let final_compressed = encoder.finish()?;
+            self.compression_buffer.extend_from_slice(&final_compressed);
+        }
+        
+        // Flush all remaining compressed data
+        if !self.compression_buffer.is_empty() {
+            self.inner.write_all(&self.compression_buffer)?;
+        }
+        
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for CompressionBufferingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(ref mut encoder) = self.compression_encoder {
+            // Write to the compression encoder (it implements Write trait)
+            encoder.write_all(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            
+            // Handle compression output using helper method
+            self.handle_compression_output()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        } else {
+            // No compression - pass through directly to encryption
+            self.inner.write(buf)?;
+        }
+        
+        Ok(buf.len())
+    }
+    
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut encoder) = self.compression_encoder {
+            // Flush compression encoder
+            encoder.flush()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            
+            // Handle compression output using helper method
+            self.handle_compression_output()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        }
+        
+        self.inner.flush()
+    }
+}
 
 /// A streaming encryption wrapper that encrypts data as it's written
 pub struct StreamingEncryptionWriter<W: Write> {
@@ -150,7 +263,7 @@ fn create_streaming_chunk_nonce(algorithm: &EncryptionAlgorithm, base_nonce: &[u
     Ok(chunk_nonce)
 }
 
-/// Stream encrypt any file or directory using a full read → tar → encrypt → write pipeline
+/// Stream encrypt any file or directory using a full read → tar → compress → encrypt → write pipeline
 /// This unified function handles both files and directories by putting them in a TAR archive
 pub fn stream_encrypt_tar(
     input_path: &str,
@@ -159,40 +272,82 @@ pub fn stream_encrypt_tar(
     algorithm: &EncryptionAlgorithm,
     argon2_params: &Argon2Params,
 ) -> Result<()> {
+    stream_encrypt_tar_with_compression(input_path, output_path, password, algorithm, argon2_params, None)
+}
+
+/// Helper function to process a directory for TAR archiving
+fn process_directory(input_path: &Path, tar_builder: &mut Builder<impl Write>) -> Result<()> {
+    println!("Counting files...");
+    let total_files = count_files_in_directory(input_path)?;
+    let progress_bar = create_standard_progress_bar(total_files, "Streaming TAR");
+    let mut processed_files = 0;
+    stream_tar_directory_recursive(
+        input_path,
+        input_path,
+        tar_builder,
+        &progress_bar,
+        &mut processed_files
+    )?;
+    progress_bar.finish_with_message("Streaming directory encryption complete");
+    Ok(())
+}
+
+/// Helper function to process a single file for TAR archiving
+fn process_file(input_path: &Path, tar_builder: &mut Builder<impl Write>) -> Result<()> {
+    println!("Adding file to TAR archive...");
+    let file_name = input_path.file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
+    let mut file = File::open(input_path)
+        .with_context(|| format!("Failed to open file: {:?}", input_path))?;
+    tar_builder.append_file(file_name, &mut file)
+        .with_context(|| format!("Failed to add file to tar: {}", file_name))?;
+    println!("File added to TAR archive");
+    Ok(())
+}
+
+/// Stream encrypt with optional compression support
+pub fn stream_encrypt_tar_with_compression(
+    input_path: &str,
+    output_path: &str,
+    password: &str,
+    algorithm: &EncryptionAlgorithm,
+    argon2_params: &Argon2Params,
+    compression: Option<CompressionConfig>,
+) -> Result<()> {
     let input_path_obj = Path::new(input_path);
-    
     if !input_path_obj.exists() {
         bail!("Input path does not exist: {}", input_path);
     }
-    
     let is_directory = input_path_obj.is_dir();
-    
-    if is_directory {
-        println!("Streaming directory encryption with full pipeline (TAR)...");
-    } else {
-        println!("Streaming file encryption with TAR archive format...");
+
+    // Print operation type
+    match (is_directory, compression.is_some()) {
+        (true, true) => println!("Streaming directory encryption with compression and full pipeline (TAR → Compress → Encrypt)..."),
+        (true, false) => println!("Streaming directory encryption with full pipeline (TAR → Encrypt)..."),
+        (false, true) => println!("Streaming file encryption with compression and TAR archive format..."),
+        (false, false) => println!("Streaming file encryption with TAR archive format..."),
     }
-    
+
     // Generate cryptographic parameters
     let mut salt = [0u8; SALT_LENGTH];
     generate_secure_random_bytes(&mut salt)?;
     let base_nonce = generate_base_nonce(algorithm)?;
     let key = derive_key(password, &salt, argon2_params)?;
-    
+
     // Create header - always mark as TAR format
-    let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32);
+    let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32, compression.clone());
     let cbor_header = serialize_header_to_cbor(&header)?;
-    
+
     // Create output file
     let output_file = File::create(output_path)
         .with_context(|| format!("Failed to create output file: {}", output_path))?;
-    
     let mut buffered_output = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
-    
+
     // Write header length and header
     buffered_output.write_all(&(cbor_header.len() as u32).to_le_bytes())?;
     buffered_output.write_all(&cbor_header)?;
-    
+
     // Create streaming encryption wrapper
     let encryption_writer = StreamingEncryptionWriter::new(
         buffered_output,
@@ -201,58 +356,84 @@ pub fn stream_encrypt_tar(
         base_nonce,
         &salt,
     )?;
-    
-    // Create streaming TAR builder (fully streaming, no seeking required)
-    let mut tar_builder = Builder::new(encryption_writer);
-    
-    if is_directory {
-        // Count files for progress tracking
-        println!("Counting files...");
-        let total_files = count_files_in_directory(input_path_obj)?;
-        let progress_bar = create_standard_progress_bar(total_files, "Streaming TAR");
+
+    // Create writer chain based on compression setting
+    if compression.is_some() {
+        let compression_writer = CompressionBufferingWriter::new(encryption_writer, compression.as_ref())?;
+        let mut tar_builder = Builder::new(compression_writer);
         
-        // Process directory recursively with streaming TAR
-        let mut processed_files = 0;
-        stream_tar_directory_recursive(
-            input_path_obj,
-            input_path_obj,
-            &mut tar_builder,
-            &progress_bar,
-            &mut processed_files
-        )?;        progress_bar.finish_with_message("Streaming directory encryption complete");
+        // Process input (file or directory)
+        if is_directory {
+            process_directory(input_path_obj, &mut tar_builder)?;
+        } else {
+            process_file(input_path_obj, &mut tar_builder)?;
+        }
+        
+        // Finalize the pipeline: TAR → Compression → Encryption → Output
+        let compression_writer = tar_builder.into_inner().context("Failed to finish TAR archive")?;
+        let encryption_writer = compression_writer.finalize()?;
+        let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
+        final_output.flush().context("Failed to flush output file")?;
     } else {
-        // Handle single file - add it to TAR archive
-        println!("Adding file to TAR archive...");
-        let file_name = input_path_obj.file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
+        let mut tar_builder = Builder::new(encryption_writer);
         
-        let mut file = File::open(input_path)
-            .with_context(|| format!("Failed to open file: {}", input_path))?;
+        // Process input (file or directory)
+        if is_directory {
+            process_directory(input_path_obj, &mut tar_builder)?;
+        } else {
+            process_file(input_path_obj, &mut tar_builder)?;
+        }
         
-        tar_builder.append_file(file_name, &mut file)
-            .with_context(|| format!("Failed to add file to tar: {}", file_name))?;
-        
-        println!("File added to TAR archive");
+        // Finalize the pipeline: TAR → Encryption → Output
+        let encryption_writer = tar_builder.into_inner().context("Failed to finish TAR archive")?;
+        let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
+        final_output.flush().context("Failed to flush output file")?;
     }
-    
-    // Finalize TAR and get the underlying encryption writer
-    let encryption_writer = tar_builder.into_inner()
-        .context("Failed to finish TAR archive")?;
-    
-    // Finalize encryption and get the underlying writer
-    let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
-    
-    // Flush the final output
-    final_output.flush()
-        .context("Failed to flush output file")?;
-    
+
     if is_directory {
         println!("Directory encrypted successfully: {}", output_path);
     } else {
         println!("File encrypted successfully: {}", output_path);
     }
+    Ok(())
+}
+
+/// Helper function to display decryption info from header
+fn display_decryption_info(header: &crate::crypto::EncryptionHeader) {
+    println!("File format version: {}", header.version);
+    println!("Encryption: {}", header.encryption_algorithm);
     
+    if let Some(ref compression) = header.compression {
+        println!("Compression: {} (level {})", compression.algorithm, compression.level);
+    }
+    
+    println!("Key derivation: {} ({}MB, {} iterations, {} threads)", 
+             header.kdf.algorithm, 
+             header.kdf.memory_cost / 1024,
+             header.kdf.time_cost,
+             header.kdf.parallelism);
+    println!("Chunked encryption: {}KB chunks", header.chunk_size / 1024);
+}
+
+/// Helper function to extract single file from TAR
+fn extract_single_file(final_data: &[u8], output_path: &str) -> Result<()> {
+    extract_single_file_from_tar(final_data, output_path)?;
+    Ok(())
+}
+
+/// Helper function to extract directory from TAR
+fn extract_directory(final_data: &[u8], output_path: &str) -> Result<()> {
+    if Path::new(output_path).exists() {
+        bail!("Output directory already exists: {}", output_path);
+    }
+    
+    fs::create_dir_all(output_path)
+        .with_context(|| format!("Failed to create output directory: {}", output_path))?;
+    
+    println!("Extracting TAR directory...");
+    extract_tar_to_directory(final_data, Path::new(output_path))?;
+    
+    println!("Directory decrypted and extracted successfully: {}", output_path);
     Ok(())
 }
 
@@ -285,8 +466,8 @@ pub fn stream_decrypt_tar(
         bail!("Invalid CBOR header length: {} bytes (file size: {} bytes)", 
               header_length, encrypted_data.len());
     }
-    if header_length > 1_048_576 { // 1MB header size limit
-        bail!("CBOR header too large: {} bytes (maximum: 1MB)", header_length);
+    if header_length > MAX_HEADER_SIZE {
+        bail!("CBOR header too large: {} bytes (maximum: {})", header_length, MAX_HEADER_SIZE);
     }
     
     // Extract CBOR header and ciphertext
@@ -294,25 +475,18 @@ pub fn stream_decrypt_tar(
     let remaining_data = &encrypted_data[4 + header_length..];
     
     // Extract HMAC (last 32 bytes) and ciphertext (everything before HMAC)
-    if remaining_data.len() < 32 {
+    if remaining_data.len() < HMAC_SIZE {
         bail!("Invalid encrypted file format - missing HMAC");
     }
-    let ciphertext = &remaining_data[..remaining_data.len() - 32];
-    let stored_hmac = &remaining_data[remaining_data.len() - 32..];
+    let ciphertext = &remaining_data[..remaining_data.len() - HMAC_SIZE];
+    let stored_hmac = &remaining_data[remaining_data.len() - HMAC_SIZE..];
     
     // Deserialize and validate header
     let header = deserialize_header_from_cbor(cbor_header_data)?;
     validate_header(&header)?;
     
     // Display encryption details
-    println!("File format version: {}", header.version);
-    println!("Encryption: {}", header.encryption_algorithm);
-    println!("Key derivation: {} ({}MB, {} iterations, {} threads)", 
-             header.kdf.algorithm, 
-             header.kdf.memory_cost / 1024,
-             header.kdf.time_cost,
-             header.kdf.parallelism);
-    println!("Chunked encryption: {}KB chunks", header.chunk_size / 1024);
+    display_decryption_info(&header);
     
     // Parse the encryption algorithm from header
     let algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
@@ -343,31 +517,33 @@ pub fn stream_decrypt_tar(
     }
     println!("File integrity verified successfully");
     
+    // Decompress data if compression was used
+    let final_data = if let Some(ref compression) = header.compression {
+        let compression_alg = CompressionAlgorithm::from_string(&compression.algorithm)?;
+        match compression_alg {
+            CompressionAlgorithm::None => plaintext,
+            CompressionAlgorithm::Zstd => {
+                println!("Decompressing data with zstd...");
+                zstd::decode_all(&plaintext[..])
+                    .context("Failed to decompress data with zstd")?
+            }
+        }
+    } else {
+        plaintext
+    };
+    
     // Extract TAR archive and determine if it's a single file or directory
-    let tar_cursor = std::io::Cursor::new(&plaintext);
+    let tar_cursor = std::io::Cursor::new(&final_data);
     let mut tar_archive = tar::Archive::new(tar_cursor);
     let entries: Result<Vec<_>, _> = tar_archive.entries()?.collect();
     let entries = entries.context("Failed to read TAR entries")?;
     
     if entries.len() == 1 {
         // Single file in TAR - extract to the output path directly
-        extract_single_file_from_tar(&plaintext, output_path)?;
+        extract_single_file(&final_data, output_path)?;
     } else {
         // Multiple files/directories - extract to directory
-        // Check if output directory already exists
-        if Path::new(output_path).exists() {
-            bail!("Output directory already exists: {}", output_path);
-        }
-        
-        // Create the output directory
-        fs::create_dir_all(output_path)
-            .with_context(|| format!("Failed to create output directory: {}", output_path))?;
-        
-        // Extract the decrypted data to the directory
-        println!("Extracting TAR directory...");
-        extract_tar_to_directory(&plaintext, Path::new(output_path))?;
-        
-        println!("Directory decrypted and extracted successfully: {}", output_path);
+        extract_directory(&final_data, output_path)?;
     }
     
     Ok(())
@@ -650,9 +826,13 @@ mod tests {
             &params,
         ).unwrap();
         
-        // Corrupt the header by modifying the header length
+        // Corrupt the header by setting an impossibly large header length
         let mut encrypted_data = fs::read(&encrypted_file).unwrap();
-        encrypted_data[0] = 0xFF; // Corrupt first byte of header length
+        // Set header length to maximum u32 value to guarantee it exceeds file size
+        encrypted_data[0] = 0xFF;
+        encrypted_data[1] = 0xFF;
+        encrypted_data[2] = 0xFF;
+        encrypted_data[3] = 0xFF;
         fs::write(&encrypted_file, &encrypted_data).unwrap();
         
         // Try to decrypt corrupted file

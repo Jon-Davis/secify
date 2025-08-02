@@ -1,5 +1,9 @@
 use clap::Parser;
-use crate::crypto::{EncryptionAlgorithm, parse_algorithm};
+use crate::crypto::{EncryptionAlgorithm, parse_algorithm, CompressionAlgorithm};
+
+fn parse_compression_algorithm(s: &str) -> Result<CompressionAlgorithm, String> {
+    CompressionAlgorithm::from_string(s).map_err(|e| e.to_string())
+}
 
 #[derive(Parser)]
 #[command(name = "secify")]
@@ -14,6 +18,12 @@ pub struct Cli {
     /// Encryption algorithm (aes256, chacha20, xchacha20, default: xchacha20)
     #[arg(short, long, value_parser = parse_algorithm, default_value = "xchacha20")]
     pub algorithm: EncryptionAlgorithm,
+    /// Optional compression algorithm (none, zstd, default: zstd)
+    #[arg(short, long, value_parser = parse_compression_algorithm, default_value = "zstd")]
+    pub compression: CompressionAlgorithm,
+    /// Compression level (1-22 for zstd, default: 3). Higher values are slower but compress better.
+    #[arg(long, default_value = "3", help = "Compression level (1-22 for zstd, default: 3)")]
+    pub compression_level: i32,
     /// Argon2 memory cost in MB (8-2048, default: 128). Higher values are more secure but slower.
     #[arg(long, default_value = "128", help = "Argon2 memory cost in MB (8-2048, default: 128)")]
     pub memory_mb: u32,

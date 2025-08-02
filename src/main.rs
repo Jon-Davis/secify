@@ -10,6 +10,16 @@ fn main() -> Result<()> {
     // Create Argon2 parameters from CLI arguments
     let argon2_params = crypto::Argon2Params::new(cli.memory_mb, cli.time_cost, cli.parallelism)?;
     
+    // Create compression config if compression is enabled
+    let compression_config = if matches!(cli.compression, crypto::CompressionAlgorithm::None) {
+        None
+    } else {
+        Some(crypto::CompressionConfig {
+            algorithm: cli.compression.to_string().to_owned(),
+            level: cli.compression_level,
+        })
+    };
+    
     match (cli.file, cli.password) {
         (Some(file), Some(password)) => {
             // Check if file exists
@@ -24,11 +34,16 @@ fn main() -> Result<()> {
             } else {
                 println!("Detected non-.sec file - encrypting...");
                 println!("Using encryption algorithm: {}", cli.algorithm.to_string());
+                
+                if let Some(ref comp_config) = compression_config {
+                    println!("Using compression: {} (level {})", comp_config.algorithm, comp_config.level);
+                }
+                
                 println!("Using chunked encryption: {}KB chunks for optimal memory usage", 
                          crypto::DEFAULT_CHUNK_SIZE / 1024);
                 println!("Using Argon2id parameters: {}MB memory, {} iterations, {} threads", 
                          argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
-                file_operations::encrypt_file(&file, &password, &cli.algorithm, &argon2_params)?;
+                file_operations::encrypt_file_with_compression(&file, &password, &cli.algorithm, &argon2_params, compression_config)?;
             }
         },
         _ => {
