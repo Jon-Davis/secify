@@ -10,7 +10,7 @@ This is just a personal project, to explore different encryption methods.
 - **Multiple Encryption Algorithms**: AES-256-GCM, ChaCha20-Poly1305, and XChaCha20-Poly1305
 - **Optional Compression**: Zstandard (zstd) compression enabled by default (level 3) for smaller encrypted files
 - **Directory Support**: Encrypts entire folders while preserving structure
-- **Future-Proof**: Extensible CBOR header format for algorithm upgrades
+- **Future-Proof**: Extensible Protocol Buffer header format for algorithm upgrades
 - **Fully Streaming Architecture**: Process files of any size with constant memory usage
   - No temporary files or full-data buffering required
   - Enables encryption of arbitrarily large files and directories
@@ -66,7 +66,7 @@ The `.sec` format is a binary container with the following structure:
 ├─────────────────────────────────────────────────────────────┤
 │ Header Length    │ 4 bytes (little-endian u32)              │
 ├─────────────────────────────────────────────────────────────┤
-│ CBOR Header      │ Variable length (self-describing)        │
+│ Protobuf Header  │ Variable length (self-describing)        │
 ├─────────────────────────────────────────────────────────────┤
 │ Encrypted Data   │ Variable length (optionally compressed)  │
 ├─────────────────────────────────────────────────────────────┤
@@ -74,9 +74,9 @@ The `.sec` format is a binary container with the following structure:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### CBOR Header Structure
+### Protocol Buffer Header Structure
 
-The header contains all encryption metadata in CBOR format:
+The header contains all encryption metadata in Protocol Buffer format:
 
 ```rust
 {

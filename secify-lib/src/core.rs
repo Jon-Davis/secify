@@ -17,7 +17,7 @@ use crate::error::{SecifyError, Result};
 /// Size of the read buffer for streaming operations
 const STREAM_BUFFER_SIZE: usize = 64 * 1024; // 64KB
 
-/// Maximum allowed CBOR header size (1MB)
+/// Maximum allowed protobuf header size (1MB)
 const MAX_HEADER_SIZE: usize = 1_048_576;
 
 /// HMAC size in bytes (SHA256)
@@ -493,7 +493,7 @@ where
     // Create header - only use TAR format for directories
     let archive_format = if is_directory { Some("tar".to_string()) } else { None };
     let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32, compression.clone(), archive_format);
-    let cbor_header = serialize_header_to_cbor(&header)?;
+    let protobuf_header = serialize_header_to_protobuf(&header)?;
 
     // Create output file
     let output_file = File::create(output_path)
@@ -501,8 +501,8 @@ where
     let mut buffered_output = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
 
     // Write header length and header
-    buffered_output.write_all(&(cbor_header.len() as u32).to_le_bytes())?;
-    buffered_output.write_all(&cbor_header)?;
+    buffered_output.write_all(&(protobuf_header.len() as u32).to_le_bytes())?;
+    buffered_output.write_all(&protobuf_header)?;
 
     // Create streaming encryption wrapper
     let mut encryption_writer = StreamingEncryptionWriter::new(
@@ -612,37 +612,38 @@ where
         .map_err(|e| SecifyError::file_error(format!("Failed to open encrypted file {}: {}", input_path, e)))?;
     let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
 
-    // Read CBOR header length (first 4 bytes)
+    // Read protobuf header length (first 4 bytes)
     let mut header_length_bytes = [0u8; 4];
     reader.read_exact(&mut header_length_bytes)
-        .map_err(|e| SecifyError::invalid_format(format!("Failed to read CBOR header length from {}: {}", input_path, e)))?;
+        .map_err(|e| SecifyError::invalid_format(format!("Failed to read protobuf header length from {}: {}", input_path, e)))?;
     let header_length = u32::from_le_bytes(header_length_bytes) as usize;
 
     // Validate header length
     if header_length == 0 {
-        return Err(SecifyError::invalid_format("Invalid CBOR header: header length is zero"));
+        return Err(SecifyError::invalid_format("Invalid protobuf header: header length is zero"));
     }
     if header_length > MAX_HEADER_SIZE {
-        return Err(SecifyError::invalid_format(format!("CBOR header too large: {} bytes (maximum: {})", header_length, MAX_HEADER_SIZE)));
+        return Err(SecifyError::invalid_format(format!("Protobuf header too large: {} bytes (maximum: {})", header_length, MAX_HEADER_SIZE)));
     }
 
-    // Read CBOR header data
-    let mut cbor_header_data = vec![0u8; header_length];
-    reader.read_exact(&mut cbor_header_data)
-        .map_err(|e| SecifyError::invalid_format(format!("Failed to read CBOR header data: {}", e)))?;
+    // Read protobuf header data
+    let mut protobuf_header_data = vec![0u8; header_length];
+    reader.read_exact(&mut protobuf_header_data)
+        .map_err(|e| SecifyError::invalid_format(format!("Failed to read protobuf header data: {}", e)))?;
 
     // Deserialize and validate header
-    let header = deserialize_header_from_cbor(&cbor_header_data)?;
+    let header = deserialize_header_from_protobuf(&protobuf_header_data)?;
     validate_header(&header)?;
     
     // Parse the encryption algorithm from header
     let algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
     
     // Extract Argon2 parameters from header
+    let kdf = header.kdf.as_ref().ok_or_else(|| SecifyError::invalid_format("Missing KDF configuration"))?;
     let argon2_params = Argon2Params::new(
-        header.kdf.memory_cost / 1024, // Convert KB back to MB
-        header.kdf.time_cost,
-        header.kdf.parallelism,
+        kdf.memory_cost / 1024, // Convert KB back to MB
+        kdf.time_cost,
+        kdf.parallelism,
     )?;
     
     // Derive decryption key from password and salt from header
@@ -660,10 +661,10 @@ where
         algorithm: header.encryption_algorithm.clone(),
         compression: header.compression.as_ref().map(|c| format!("{} (level {})", c.algorithm, c.level)),
         kdf_info: format!("{} ({}MB, {} iterations, {} threads)", 
-                         header.kdf.algorithm, 
-                         header.kdf.memory_cost / 1024,
-                         header.kdf.time_cost,
-                         header.kdf.parallelism),
+                         kdf.algorithm, 
+                         kdf.memory_cost / 1024,
+                         kdf.time_cost,
+                         kdf.parallelism),
         chunk_size: header.chunk_size,
     };
     
@@ -770,8 +771,8 @@ where
     
     // Skip header
     verification_reader.read_exact(&mut [0u8; 4])?; // header length
-    let mut cbor_skip = vec![0u8; header_length];
-    verification_reader.read_exact(&mut cbor_skip)?;
+    let mut protobuf_skip = vec![0u8; header_length];
+    verification_reader.read_exact(&mut protobuf_skip)?;
     
     // Create decryption reader for HMAC verification
     let verification_algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;

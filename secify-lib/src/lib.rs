@@ -56,7 +56,7 @@ pub use crypto::{
     EncryptionAlgorithm, CompressionAlgorithm, CompressionConfig, Argon2Params,
     encrypt_data, decrypt_data, derive_key, derive_key_with_callback, generate_secure_random_bytes,
     generate_base_nonce, create_encryption_header, validate_header,
-    deserialize_header_from_cbor, serialize_header_to_cbor, parse_algorithm,
+    deserialize_header_from_protobuf, serialize_header_to_protobuf, parse_algorithm,
     DEFAULT_CHUNK_SIZE, SALT_LENGTH, KEY_LENGTH, FILE_FORMAT_VERSION
 };
 

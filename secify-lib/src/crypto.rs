@@ -6,10 +6,10 @@ use aes_gcm::{
 use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305, Nonce as ChaNonce, XNonce};
 use argon2::{Argon2, Algorithm, Version, Params, PasswordHasher};
 use argon2::password_hash::{rand_core::RngCore, SaltString};
-use serde::{Serialize, Deserialize};
 use std::time::Instant;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use prost::Message;
 
 // Constants
 pub const SALT_LENGTH: usize = 32;
@@ -148,49 +148,8 @@ impl CompressionAlgorithm {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct CompressionConfig {
-    /// Compression algorithm identifier
-    pub algorithm: String,
-    /// Compression level (algorithm-specific)
-    pub level: i32,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct EncryptionHeader {
-    /// File format version for future compatibility
-    pub version: u32,
-    /// Encryption algorithm identifier
-    pub encryption_algorithm: String,
-    /// Key derivation function details
-    pub kdf: KeyDerivationConfig,
-    /// Salt for key derivation
-    pub salt: Vec<u8>,
-    /// Nonce/IV for encryption (base nonce for chunked encryption)
-    pub nonce: Vec<u8>,
-    /// Chunk size used for streaming encryption 
-    pub chunk_size: u32,
-    /// Optional compression configuration
-    pub compression: Option<CompressionConfig>,
-    /// Optional archive format (only present for directories)
-    pub archive: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct KeyDerivationConfig {
-    /// Algorithm name (e.g., "Argon2id")
-    pub algorithm: String,
-    /// Version of the algorithm
-    pub version: String,
-    /// Memory cost in KB
-    pub memory_cost: u32,
-    /// Time cost (iterations)
-    pub time_cost: u32,
-    /// Parallelism (number of threads)
-    pub parallelism: u32,
-    /// Output length in bytes
-    pub output_length: u32,
-}
+// Include the generated protobuf structs
+include!(concat!(env!("OUT_DIR"), "/secify.rs"));
 
 pub fn generate_secure_random_bytes(buffer: &mut [u8]) -> Result<()> {
     // Use cryptographically secure random number generator
@@ -389,21 +348,28 @@ pub fn decrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENG
 }
 
 pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32, compression: Option<CompressionConfig>, archive: Option<String>) -> EncryptionHeader {
+    let kdf = KeyDerivationConfig {
+        algorithm: "Argon2id".to_owned(),
+        version: "0x13".to_owned(),
+        memory_cost: argon2_params.memory_kb(),
+        time_cost: argon2_params.time_cost,
+        parallelism: argon2_params.parallelism,
+        output_length: KEY_LENGTH as u32,
+    };
+    
+    let compression_config = compression.map(|c| super::CompressionConfig {
+        algorithm: c.algorithm,
+        level: c.level,
+    });
+    
     EncryptionHeader {
         version: FILE_FORMAT_VERSION,
         encryption_algorithm: algorithm.to_string().to_owned(),
-        kdf: KeyDerivationConfig {
-            algorithm: "Argon2id".to_owned(),
-            version: "0x13".to_owned(),
-            memory_cost: argon2_params.memory_kb(),
-            time_cost: argon2_params.time_cost,
-            parallelism: argon2_params.parallelism,
-            output_length: KEY_LENGTH as u32,
-        },
+        kdf: Some(kdf),
         salt: salt.to_vec(),
         nonce: nonce.to_vec(),
         chunk_size,
-        compression,
+        compression: compression_config,
         archive,
     }
 }
@@ -420,17 +386,16 @@ pub fn generate_base_nonce(algorithm: &EncryptionAlgorithm) -> Result<Vec<u8>> {
     Ok(base_nonce)
 }
 
-pub fn serialize_header_to_cbor(header: &EncryptionHeader) -> Result<Vec<u8>> {
-    let mut cbor_data = Vec::new();
-    ciborium::ser::into_writer(header, &mut cbor_data)
-        .map_err(|e| SecifyError::CborSerialization(e))?;
-    Ok(cbor_data)
+pub fn serialize_header_to_protobuf(header: &EncryptionHeader) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    header.encode(&mut buf)
+        .map_err(|e| SecifyError::serialization(format!("Failed to encode protobuf: {}", e)))?;
+    Ok(buf)
 }
 
-pub fn deserialize_header_from_cbor(cbor_data: &[u8]) -> Result<EncryptionHeader> {
-    let header: EncryptionHeader = ciborium::de::from_reader(cbor_data)
-        .map_err(|e| SecifyError::Serialization(e))?;
-    Ok(header)
+pub fn deserialize_header_from_protobuf(data: &[u8]) -> Result<EncryptionHeader> {
+    EncryptionHeader::decode(data)
+        .map_err(|e| SecifyError::serialization(format!("Failed to decode protobuf: {}", e)))
 }
 
 pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
@@ -444,8 +409,9 @@ pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
     let algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
     
     // Validate KDF
-    if header.kdf.algorithm != "Argon2id" {
-        return Err(SecifyError::invalid_format(format!("Unsupported key derivation function: {}", header.kdf.algorithm)));
+    let kdf = header.kdf.as_ref().ok_or_else(|| SecifyError::invalid_format("Missing KDF configuration"))?;
+    if kdf.algorithm != "Argon2id" {
+        return Err(SecifyError::invalid_format(format!("Unsupported key derivation function: {}", kdf.algorithm)));
     }
     
     // Validate salt and nonce lengths
@@ -727,10 +693,11 @@ mod tests {
         let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         assert_eq!(header.version, FILE_FORMAT_VERSION);
         assert_eq!(header.encryption_algorithm, "XChaCha20-Poly1305");
-        assert_eq!(header.kdf.algorithm, "Argon2id");
-        assert_eq!(header.kdf.memory_cost, params.memory_kb());
-        assert_eq!(header.kdf.time_cost, params.time_cost);
-        assert_eq!(header.kdf.parallelism, params.parallelism);
+        let kdf = header.kdf.as_ref().expect("KDF should be present");
+        assert_eq!(kdf.algorithm, "Argon2id");
+        assert_eq!(kdf.memory_cost, params.memory_kb());
+        assert_eq!(kdf.time_cost, params.time_cost);
+        assert_eq!(kdf.parallelism, params.parallelism);
         assert_eq!(header.salt, salt.to_vec());
         assert_eq!(header.nonce, base_nonce);
         assert_eq!(header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
@@ -743,25 +710,25 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_deserialize_header_cbor() {
+    fn test_serialize_deserialize_header_protobuf() {
         let algorithm = EncryptionAlgorithm::ChaCha20Poly1305;
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
         let original_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
-        // Serialize to CBOR
-        let cbor_data = serialize_header_to_cbor(&original_header).unwrap();
-        assert!(!cbor_data.is_empty());
+        // Serialize to protobuf
+        let protobuf_data = serialize_header_to_protobuf(&original_header).unwrap();
+        assert!(!protobuf_data.is_empty());
         
-        // Deserialize from CBOR
-        let deserialized_header = deserialize_header_from_cbor(&cbor_data).unwrap();
+        // Deserialize from protobuf
+        let deserialized_header = deserialize_header_from_protobuf(&protobuf_data).unwrap();
         
         // Compare fields
         assert_eq!(original_header.version, deserialized_header.version);
         assert_eq!(original_header.encryption_algorithm, deserialized_header.encryption_algorithm);
-        assert_eq!(original_header.kdf.algorithm, deserialized_header.kdf.algorithm);
-        assert_eq!(original_header.kdf.memory_cost, deserialized_header.kdf.memory_cost);
+        assert_eq!(original_header.kdf.as_ref().unwrap().algorithm, deserialized_header.kdf.as_ref().unwrap().algorithm);
+        assert_eq!(original_header.kdf.as_ref().unwrap().memory_cost, deserialized_header.kdf.as_ref().unwrap().memory_cost);
         assert_eq!(original_header.salt, deserialized_header.salt);
         assert_eq!(original_header.nonce, deserialized_header.nonce);
         assert_eq!(original_header.chunk_size, deserialized_header.chunk_size);
@@ -814,7 +781,9 @@ mod tests {
         let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
         // Set invalid KDF
-        header.kdf.algorithm = "PBKDF2".to_string();
+        if let Some(ref mut kdf) = header.kdf {
+            kdf.algorithm = "PBKDF2".to_string();
+        }
         assert!(validate_header(&header).is_err());
     }
 
@@ -1190,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cbor_serialization_roundtrip_all_algorithms() {
+    fn test_protobuf_serialization_roundtrip_all_algorithms() {
         let algorithms = [
             EncryptionAlgorithm::Aes256Gcm,
             EncryptionAlgorithm::ChaCha20Poly1305,
@@ -1204,8 +1173,8 @@ mod tests {
             let original_header = create_encryption_header(&salt, &base_nonce, algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
             
             // Serialize and deserialize
-            let cbor_data = serialize_header_to_cbor(&original_header).unwrap();
-            let deserialized_header = deserialize_header_from_cbor(&cbor_data).unwrap();
+            let protobuf_data = serialize_header_to_protobuf(&original_header).unwrap();
+            let deserialized_header = deserialize_header_from_protobuf(&protobuf_data).unwrap();
             
             // Validate both headers
             assert!(validate_header(&original_header).is_ok());

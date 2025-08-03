@@ -57,12 +57,8 @@ pub enum SecifyError {
     FileError { message: String },
 
     /// Serialization/deserialization failed
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] ciborium::de::Error<std::io::Error>),
-
-    /// CBOR serialization failed
-    #[error("CBOR serialization error: {0}")]
-    CborSerialization(#[from] ciborium::ser::Error<std::io::Error>),
+    #[error("Serialization error: {message}")]
+    Serialization { message: String },
 
     /// Argon2 password hashing error
     #[error("Argon2 error: {0}")]
@@ -154,6 +150,13 @@ impl SecifyError {
     /// Create a generic error with a custom message
     pub fn generic<S: Into<String>>(message: S) -> Self {
         Self::Generic {
+            message: message.into(),
+        }
+    }
+
+    /// Create a serialization error with a custom message
+    pub fn serialization<S: Into<String>>(message: S) -> Self {
+        Self::Serialization {
             message: message.into(),
         }
     }
