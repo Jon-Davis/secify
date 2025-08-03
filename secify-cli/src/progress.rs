@@ -17,7 +17,7 @@ pub fn create_standard_progress_bar(total: u64, message: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
             .unwrap()
             .progress_chars("#>-"),
     );
@@ -30,7 +30,7 @@ pub fn create_byte_progress_bar(total_bytes: u64, message: &str) -> ProgressBar 
     let pb = ProgressBar::new(total_bytes);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} {msg} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .template("{spinner:.green} {msg} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
             .unwrap()
             .progress_chars("#>-"),
     );
