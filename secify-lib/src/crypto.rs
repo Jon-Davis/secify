@@ -1,4 +1,4 @@
-use anyhow::{Result, Context, bail};
+use crate::error::{SecifyError, Result};
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce
@@ -44,22 +44,22 @@ impl Argon2Params {
     pub fn new(memory_mb: u32, time_cost: u32, parallelism: u32) -> Result<Self> {
         // Validate parameters
         if memory_mb < 8 {
-            bail!("Memory cost must be at least 8 MB");
+            return Err(SecifyError::invalid_config("Memory cost must be at least 8 MB"));
         }
         if memory_mb > 2048 {
-            bail!("Memory cost cannot exceed 2048 MB (2GB)");
+            return Err(SecifyError::invalid_config("Memory cost cannot exceed 2048 MB (2GB)"));
         }
         if time_cost < 1 {
-            bail!("Time cost must be at least 1 iteration");
+            return Err(SecifyError::invalid_config("Time cost must be at least 1 iteration"));
         }
         if time_cost > 100 {
-            bail!("Time cost cannot exceed 100 iterations");
+            return Err(SecifyError::invalid_config("Time cost cannot exceed 100 iterations"));
         }
         if parallelism < 1 {
-            bail!("Parallelism must be at least 1 thread");
+            return Err(SecifyError::invalid_config("Parallelism must be at least 1 thread"));
         }
         if parallelism > 16 {
-            bail!("Parallelism cannot exceed 16 threads");
+            return Err(SecifyError::invalid_config("Parallelism cannot exceed 16 threads"));
         }
         
         Ok(Self {
@@ -87,7 +87,7 @@ impl EncryptionAlgorithm {
             "AES-256-GCM" => Ok(EncryptionAlgorithm::Aes256Gcm),
             "ChaCha20-Poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
             "XChaCha20-Poly1305" => Ok(EncryptionAlgorithm::XChaCha20Poly1305),
-            _ => bail!("Unsupported encryption algorithm: {}", s),
+            _ => Err(SecifyError::invalid_config(format!("Unsupported encryption algorithm: {}", s))),
         }
     }
     
@@ -116,12 +116,12 @@ impl EncryptionAlgorithm {
     }
 }
 
-pub fn parse_algorithm(s: &str) -> Result<EncryptionAlgorithm, String> {
+pub fn parse_algorithm(s: &str) -> Result<EncryptionAlgorithm> {
     match s.to_lowercase().as_str() {
         "aes256" | "aes" | "aes-256-gcm" => Ok(EncryptionAlgorithm::Aes256Gcm),
         "chacha20" | "chacha" | "chacha20-poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
         "xchacha20" | "xchacha" | "xchacha20-poly1305" => Ok(EncryptionAlgorithm::XChaCha20Poly1305),
-        _ => Err(format!("Invalid algorithm '{s}'. Valid options: aes256, chacha20, xchacha20")),
+        _ => Err(SecifyError::invalid_config(format!("Invalid algorithm '{s}'. Valid options: aes256, chacha20, xchacha20"))),
     }
 }
 
@@ -136,7 +136,7 @@ impl CompressionAlgorithm {
         match s.to_lowercase().as_str() {
             "none" => Ok(CompressionAlgorithm::None),
             "zstd" => Ok(CompressionAlgorithm::Zstd),
-            _ => bail!("Unsupported compression algorithm: {}", s),
+            _ => Err(SecifyError::invalid_config(format!("Unsupported compression algorithm: {}", s))),
         }
     }
     
@@ -197,7 +197,7 @@ pub fn generate_secure_random_bytes(buffer: &mut [u8]) -> Result<()> {
     
     // Verify we got non-zero bytes (extremely unlikely but good practice)
     if buffer.iter().all(|&b| b == 0) {
-        bail!("Failed to generate secure random bytes - all zeros returned");
+        return Err(SecifyError::crypto("Failed to generate secure random bytes - all zeros returned"));
     }
     
     Ok(())
@@ -214,11 +214,11 @@ pub fn derive_key_with_callback(password: &str, salt: &[u8], argon2_params: &Arg
         argon2_params.time_cost,   // time cost: iterations
         argon2_params.parallelism, // parallelism: threads
         Some(KEY_LENGTH) // output length: 32 bytes
-    ).map_err(|e| anyhow::anyhow!("Failed to create Argon2 params: {}", e))?;
+    ).map_err(|e| SecifyError::key_derivation(format!("Failed to create Argon2 params: {}", e)))?;
     
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let salt_string = SaltString::encode_b64(salt)
-        .map_err(|e| anyhow::anyhow!("Failed to encode salt: {}", e))?;
+        .map_err(|e| SecifyError::key_derivation(format!("Failed to encode salt: {}", e)))?;
     
     log_callback(&format!("Deriving encryption key with Argon2id ({}MB, {} iterations, {} threads)...", 
              argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism));
@@ -226,17 +226,17 @@ pub fn derive_key_with_callback(password: &str, salt: &[u8], argon2_params: &Arg
     
     let password_hash = argon2
         .hash_password(password.as_bytes(), &salt_string)
-        .map_err(|e| anyhow::anyhow!("Failed to hash password: {}", e))?;
+        .map_err(|e| SecifyError::key_derivation(format!("Failed to hash password: {}", e)))?;
     
     let duration = start_time.elapsed();
     log_callback(&format!("Argon2 key derivation completed in {:.2} seconds", duration.as_secs_f64()));
     
     let hash = password_hash.hash
-        .context("No hash in password hash")?;
+        .ok_or_else(|| SecifyError::key_derivation("No hash in password hash"))?;
     let hash_bytes = hash.as_bytes();
     
     if hash_bytes.len() < KEY_LENGTH {
-        bail!("Hash too short for key derivation");
+        return Err(SecifyError::key_derivation("Hash too short for key derivation"));
     }
     
     let mut key = [0u8; KEY_LENGTH];
@@ -248,24 +248,24 @@ pub fn encrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], non
     match algorithm {
         EncryptionAlgorithm::Aes256Gcm => {
             let cipher = Aes256Gcm::new_from_slice(key)
-                .map_err(|e| anyhow::anyhow!("Failed to create AES cipher: {}", e))?;
+                .map_err(|e| SecifyError::encryption(format!("Failed to create AES cipher: {}", e)))?;
             let nonce = Nonce::from_slice(nonce);
             cipher.encrypt(nonce, data)
-                .map_err(|e| anyhow::anyhow!("Failed to encrypt with AES-256-GCM: {}", e))
+                .map_err(|e| SecifyError::encryption(format!("Failed to encrypt with AES-256-GCM: {}", e)))
         }
         EncryptionAlgorithm::ChaCha20Poly1305 => {
             let cipher = ChaCha20Poly1305::new_from_slice(key)
-                .map_err(|e| anyhow::anyhow!("Failed to create ChaCha20 cipher: {}", e))?;
+                .map_err(|e| SecifyError::encryption(format!("Failed to create ChaCha20 cipher: {}", e)))?;
             let nonce = ChaNonce::from_slice(nonce);
             cipher.encrypt(nonce, data)
-                .map_err(|e| anyhow::anyhow!("Failed to encrypt with ChaCha20-Poly1305: {}", e))
+                .map_err(|e| SecifyError::encryption(format!("Failed to encrypt with ChaCha20-Poly1305: {}", e)))
         }
         EncryptionAlgorithm::XChaCha20Poly1305 => {
             let cipher = XChaCha20Poly1305::new_from_slice(key)
-                .map_err(|e| anyhow::anyhow!("Failed to create XChaCha20 cipher: {}", e))?;
+                .map_err(|e| SecifyError::encryption(format!("Failed to create XChaCha20 cipher: {}", e)))?;
             let nonce = XNonce::from_slice(nonce);
             cipher.encrypt(nonce, data)
-                .map_err(|e| anyhow::anyhow!("Failed to encrypt with XChaCha20-Poly1305: {}", e))
+                .map_err(|e| SecifyError::encryption(format!("Failed to encrypt with XChaCha20-Poly1305: {}", e)))
         }
     }
 }
@@ -273,12 +273,12 @@ pub fn encrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], non
 /// Encrypt data in chunks for streaming encryption with fixed chunk sizes
 pub fn encrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], base_nonce: &[u8], data: &[u8], chunk_size: usize) -> Result<Vec<u8>> {
     if chunk_size == 0 {
-        bail!("Chunk size cannot be zero");
+        return Err(SecifyError::invalid_config("Chunk size cannot be zero"));
     }
     
     let auth_tag_size = algorithm.auth_tag_size();
     if chunk_size <= auth_tag_size {
-        bail!("Chunk size must be larger than authentication tag size ({} bytes)", auth_tag_size);
+        return Err(SecifyError::invalid_config(format!("Chunk size must be larger than authentication tag size ({} bytes)", auth_tag_size)));
     }
     
     // Calculate plaintext size per chunk to ensure fixed encrypted chunk size
@@ -294,7 +294,7 @@ pub fn encrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENG
         // Verify the encrypted chunk size is as expected (except for the last chunk)
         let expected_size = chunk.len() + auth_tag_size;
         if encrypted_chunk.len() != expected_size {
-            bail!("Unexpected encrypted chunk size: got {}, expected {}", encrypted_chunk.len(), expected_size);
+            return Err(SecifyError::encryption(format!("Unexpected encrypted chunk size: got {}, expected {}", encrypted_chunk.len(), expected_size)));
         }
         
         // Store encrypted chunk directly without length prefix
@@ -315,7 +315,7 @@ fn create_chunk_nonce(algorithm: &EncryptionAlgorithm, base_nonce: &[u8], chunk_
         EncryptionAlgorithm::Aes256Gcm | EncryptionAlgorithm::ChaCha20Poly1305 => {
             // 96-bit nonces: 8 bytes base + 4 bytes counter
             if base_nonce.len() != 8 {
-                bail!("Base nonce for {}/ChaCha20 must be 8 bytes, got {}", algorithm.to_string(), base_nonce.len());
+                return Err(SecifyError::invalid_config(format!("Base nonce for {}/ChaCha20 must be 8 bytes, got {}", algorithm.to_string(), base_nonce.len())));
             }
             chunk_nonce[..8].copy_from_slice(base_nonce);
             chunk_nonce[8..12].copy_from_slice(&(chunk_counter as u32).to_le_bytes());
@@ -323,7 +323,7 @@ fn create_chunk_nonce(algorithm: &EncryptionAlgorithm, base_nonce: &[u8], chunk_
         EncryptionAlgorithm::XChaCha20Poly1305 => {
             // 192-bit nonces: 16 bytes base + 8 bytes counter
             if base_nonce.len() != 16 {
-                bail!("Base nonce for XChaCha20 must be 16 bytes, got {}", base_nonce.len());
+                return Err(SecifyError::invalid_config(format!("Base nonce for XChaCha20 must be 16 bytes, got {}", base_nonce.len())));
             }
             chunk_nonce[..16].copy_from_slice(base_nonce);
             chunk_nonce[16..24].copy_from_slice(&chunk_counter.to_le_bytes());
@@ -337,24 +337,24 @@ pub fn decrypt_data(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENGTH], non
     match algorithm {
         EncryptionAlgorithm::Aes256Gcm => {
             let cipher = Aes256Gcm::new_from_slice(key)
-                .map_err(|e| anyhow::anyhow!("Failed to create AES cipher: {}", e))?;
+                .map_err(|e| SecifyError::crypto(format!("Failed to create AES cipher: {}", e)))?;
             let nonce = Nonce::from_slice(nonce);
             cipher.decrypt(nonce, ciphertext)
-                .map_err(|e| anyhow::anyhow!("Failed to decrypt with AES-256-GCM - incorrect password or corrupted file: {}", e))
+                .map_err(|e| SecifyError::decryption(format!("Failed to decrypt with AES-256-GCM - incorrect password or corrupted file: {}", e)))
         }
         EncryptionAlgorithm::ChaCha20Poly1305 => {
             let cipher = ChaCha20Poly1305::new_from_slice(key)
-                .map_err(|e| anyhow::anyhow!("Failed to create ChaCha20 cipher: {}", e))?;
+                .map_err(|e| SecifyError::crypto(format!("Failed to create ChaCha20 cipher: {}", e)))?;
             let nonce = ChaNonce::from_slice(nonce);
             cipher.decrypt(nonce, ciphertext)
-                .map_err(|e| anyhow::anyhow!("Failed to decrypt with ChaCha20-Poly1305 - incorrect password or corrupted file: {}", e))
+                .map_err(|e| SecifyError::decryption(format!("Failed to decrypt with ChaCha20-Poly1305 - incorrect password or corrupted file: {}", e)))
         }
         EncryptionAlgorithm::XChaCha20Poly1305 => {
             let cipher = XChaCha20Poly1305::new_from_slice(key)
-                .map_err(|e| anyhow::anyhow!("Failed to create XChaCha20 cipher: {}", e))?;
+                .map_err(|e| SecifyError::crypto(format!("Failed to create XChaCha20 cipher: {}", e)))?;
             let nonce = XNonce::from_slice(nonce);
             cipher.decrypt(nonce, ciphertext)
-                .map_err(|e| anyhow::anyhow!("Failed to decrypt with XChaCha20-Poly1305 - incorrect password or corrupted file: {}", e))
+                .map_err(|e| SecifyError::decryption(format!("Failed to decrypt with XChaCha20-Poly1305 - incorrect password or corrupted file: {}", e)))
         }
     }
 }
@@ -420,21 +420,21 @@ pub fn generate_base_nonce(algorithm: &EncryptionAlgorithm) -> Result<Vec<u8>> {
 pub fn serialize_header_to_cbor(header: &EncryptionHeader) -> Result<Vec<u8>> {
     let mut cbor_data = Vec::new();
     ciborium::ser::into_writer(header, &mut cbor_data)
-        .context("Failed to serialize header to CBOR")?;
+        .map_err(|e| SecifyError::CborSerialization(e))?;
     Ok(cbor_data)
 }
 
 pub fn deserialize_header_from_cbor(cbor_data: &[u8]) -> Result<EncryptionHeader> {
     let header: EncryptionHeader = ciborium::de::from_reader(cbor_data)
-        .context("Failed to deserialize header from CBOR")?;
+        .map_err(|e| SecifyError::Serialization(e))?;
     Ok(header)
 }
 
 pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
     // Check version compatibility
     if header.version > FILE_FORMAT_VERSION {
-        bail!("Unsupported file format version: {}. This tool supports up to version {}.", 
-              header.version, FILE_FORMAT_VERSION);
+        return Err(SecifyError::invalid_format(format!("Unsupported file format version: {}. This tool supports up to version {}.", 
+              header.version, FILE_FORMAT_VERSION)));
     }
     
     // Validate encryption algorithm (parse to ensure it's supported)
@@ -442,12 +442,12 @@ pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
     
     // Validate KDF
     if header.kdf.algorithm != "Argon2id" {
-        bail!("Unsupported key derivation function: {}", header.kdf.algorithm);
+        return Err(SecifyError::invalid_format(format!("Unsupported key derivation function: {}", header.kdf.algorithm)));
     }
     
     // Validate salt and nonce lengths
     if header.salt.len() != SALT_LENGTH {
-        bail!("Invalid salt length: expected {}, got {}", SALT_LENGTH, header.salt.len());
+        return Err(SecifyError::invalid_format(format!("Invalid salt length: expected {}, got {}", SALT_LENGTH, header.salt.len())));
     }
     
     // Validate base nonce length for chunked encryption
@@ -457,13 +457,13 @@ pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
     };
     
     if header.nonce.len() != expected_base_nonce_length {
-        bail!("Invalid base nonce length for {} (chunked): expected {}, got {}", 
-              algorithm.to_string(), expected_base_nonce_length, header.nonce.len());
+        return Err(SecifyError::invalid_format(format!("Invalid base nonce length for {} (chunked): expected {}, got {}", 
+              algorithm.to_string(), expected_base_nonce_length, header.nonce.len())));
     }
     
     // Ensure chunk_size is valid for chunked encryption
     if header.chunk_size == 0 {
-        bail!("Invalid chunk size: chunked encryption requires chunk_size > 0");
+        return Err(SecifyError::invalid_config("Invalid chunk size: chunked encryption requires chunk_size > 0"));
     }
     
     // Validate compression configuration if present
@@ -476,7 +476,7 @@ pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
             CompressionAlgorithm::Zstd => {
                 // Validate zstd compression level (1-22 is typical range)
                 if compression.level < 1 || compression.level > 22 {
-                    bail!("Invalid zstd compression level: {}. Valid range is 1-22.", compression.level);
+                    return Err(SecifyError::invalid_config(format!("Invalid zstd compression level: {}. Valid range is 1-22.", compression.level)));
                 }
             }
         }
@@ -495,7 +495,7 @@ pub fn compute_hmac(plaintext: &[u8], key: &[u8; KEY_LENGTH], salt: &[u8]) -> Re
     hmac_key.extend_from_slice(salt);
     
     let mut mac = <HmacSha256 as Mac>::new_from_slice(&hmac_key)
-        .map_err(|e| anyhow::anyhow!("Failed to create HMAC: {}", e))?;
+        .map_err(|e| SecifyError::crypto(format!("Failed to create HMAC: {}", e)))?;
     
     mac.update(plaintext);
     let result = mac.finalize();

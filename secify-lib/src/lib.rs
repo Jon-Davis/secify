@@ -16,40 +16,47 @@
 //! # Examples
 //! 
 //! ```rust
-//! use secify_lib::{encrypt_core, decrypt_core, EncryptionAlgorithm, Argon2Params};
+//! use secify_lib::{encrypt_core, decrypt_core, EncryptionAlgorithm, Argon2Params, Result};
 //! 
-//! // Encrypt a file
-//! let params = Argon2Params::default();
-//! encrypt_core(
-//!     "input.txt",
-//!     "output.sec", 
-//!     "password",
-//!     &EncryptionAlgorithm::XChaCha20Poly1305,
-//!     &params,
-//!     None, // No compression
-//!     |progress| println!("Encrypt progress: {:?}", progress),
-//!     |msg| println!("Log: {}", msg),
-//! )?;
-//! 
-//! // Decrypt a file
-//! decrypt_core(
-//!     "output.sec",
-//!     "restored.txt",
-//!     "password", 
-//!     |progress| println!("Decrypt progress: {:?}", progress),
-//!     |msg| println!("Log: {}", msg),
-//! )?;
+//! fn example() -> Result<()> {
+//!     // Encrypt a file
+//!     let params = Argon2Params::default();
+//!     encrypt_core(
+//!         "input.txt",
+//!         "output.sec", 
+//!         "password",
+//!         &EncryptionAlgorithm::XChaCha20Poly1305,
+//!         &params,
+//!         None, // No compression
+//!         &|progress| println!("Encrypt progress: {:?}", progress),
+//!         &|msg| println!("Log: {}", msg),
+//!     )?;
+//!     
+//!     // Decrypt a file
+//!     decrypt_core(
+//!         "output.sec",
+//!         "restored.txt",
+//!         "password", 
+//!         &|progress| println!("Decrypt progress: {:?}", progress),
+//!         &|msg| println!("Log: {}", msg),
+//!     )?;
+//!     
+//!     Ok(())
+//! }
 //! ```
 
 pub mod crypto;
 pub mod core;
+pub mod error;
 
 // Re-export the main types and functions for convenience
+pub use error::{SecifyError, Result};
+
 pub use crypto::{
     EncryptionAlgorithm, CompressionAlgorithm, CompressionConfig, Argon2Params,
     encrypt_data, decrypt_data, derive_key, derive_key_with_callback, generate_secure_random_bytes,
     generate_base_nonce, create_encryption_header, validate_header,
-    deserialize_header_from_cbor, serialize_header_to_cbor,
+    deserialize_header_from_cbor, serialize_header_to_cbor, parse_algorithm,
     DEFAULT_CHUNK_SIZE, SALT_LENGTH, KEY_LENGTH, FILE_FORMAT_VERSION
 };
 

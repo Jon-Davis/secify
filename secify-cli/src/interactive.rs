@@ -275,13 +275,15 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
         println!("\nDecrypting file...");
         // Determine output path (remove .sec extension)
         let output_path = &file_path[..file_path.len() - 4];
-        decrypt_with_ui(&file_path, output_path, &password)?;
+        decrypt_with_ui(&file_path, output_path, &password)
+            .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
     } else {
         println!("\nEncrypting file...");
         // Create output path
         let clean_path = file_path.trim_end_matches('/').trim_end_matches('\\');
         let output_path = format!("{clean_path}.sec");
-        encrypt_with_ui(&file_path, &output_path, &password, &algorithm, &argon2_params, compression_config)?;
+        encrypt_with_ui(&file_path, &output_path, &password, &algorithm, &argon2_params, compression_config)
+            .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
     }
     
     Ok(())

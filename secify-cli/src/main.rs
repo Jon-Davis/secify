@@ -55,7 +55,8 @@ fn main() -> Result<()> {
                 // Determine output path (remove .sec extension)
                 let output_path = &file[..file.len() - 4];
                 
-                decrypt_with_ui(&file, output_path, &password)?;
+                decrypt_with_ui(&file, output_path, &password)
+                    .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
             } else {
                 println!("Detected non-.sec file - encrypting...");
                 println!("Using encryption algorithm: {}", cli.algorithm.to_string());
@@ -73,7 +74,8 @@ fn main() -> Result<()> {
                 let clean_path = file.trim_end_matches('/').trim_end_matches('\\');
                 let output_path = format!("{clean_path}.sec");
                 
-                encrypt_with_ui(&file, &output_path, &password, &cli.algorithm, &argon2_params, compression_config)?;
+                encrypt_with_ui(&file, &output_path, &password, &cli.algorithm, &argon2_params, compression_config)
+                    .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
             }
         },
         None => {

@@ -1,13 +1,8 @@
 use clap::Parser;
-use secify_lib::{EncryptionAlgorithm, CompressionAlgorithm};
+use secify_lib::{EncryptionAlgorithm, CompressionAlgorithm, parse_algorithm};
 
-fn parse_algorithm(s: &str) -> Result<EncryptionAlgorithm, String> {
-    match s.to_lowercase().as_str() {
-        "aes256" | "aes" | "aes-256-gcm" => Ok(EncryptionAlgorithm::Aes256Gcm),
-        "chacha20" | "chacha" | "chacha20-poly1305" => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
-        "xchacha20" | "xchacha" | "xchacha20-poly1305" => Ok(EncryptionAlgorithm::XChaCha20Poly1305),
-        _ => Err(format!("Unsupported encryption algorithm: {}. Valid options: aes256, chacha20, xchacha20", s)),
-    }
+fn parse_algorithm_for_clap(s: &str) -> Result<EncryptionAlgorithm, String> {
+    parse_algorithm(s).map_err(|e| e.to_string())
 }
 
 fn parse_compression_algorithm(s: &str) -> Result<CompressionAlgorithm, String> {
@@ -29,7 +24,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub password: Option<String>,
     /// Encryption algorithm (aes256, chacha20, xchacha20, default: xchacha20)
-    #[arg(short, long, value_parser = parse_algorithm, default_value = "xchacha20")]
+    #[arg(short, long, value_parser = parse_algorithm_for_clap, default_value = "xchacha20")]
     pub algorithm: EncryptionAlgorithm,
     /// Optional compression algorithm (none, zstd, default: zstd)
     #[arg(short, long, value_parser = parse_compression_algorithm, default_value = "zstd")]

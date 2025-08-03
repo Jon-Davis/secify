@@ -5,12 +5,12 @@
 use std::time::Instant;
 use std::rc::Rc;
 use std::cell::RefCell;
-use anyhow::Result;
-use indicatif::{ProgressBar, ProgressStyle};
 use secify_lib::{
     encrypt_core, decrypt_core, 
-    EncryptProgress, DecryptProgress, EncryptionAlgorithm, Argon2Params, CompressionConfig
+    EncryptProgress, DecryptProgress, EncryptionAlgorithm, Argon2Params, CompressionConfig,
+    Result as SecifyResult
 };
+use indicatif::{ProgressBar, ProgressStyle};
 
 /// Create a standard progress bar for file counting operations
 pub fn create_standard_progress_bar(total: u64, message: &str) -> ProgressBar {
@@ -46,7 +46,7 @@ pub fn encrypt_with_ui(
     algorithm: &EncryptionAlgorithm,
     argon2_params: &Argon2Params,
     compression: Option<CompressionConfig>,
-) -> Result<()> {
+) -> SecifyResult<()> {
     let progress_bar = Rc::new(RefCell::new(None::<ProgressBar>));
     let start_time = Instant::now();
     
@@ -122,7 +122,7 @@ pub fn decrypt_with_ui(
     input_path: &str,
     output_path: &str,
     password: &str,
-) -> Result<()> {
+) -> SecifyResult<()> {
     let progress_bar = Rc::new(RefCell::new(None::<ProgressBar>));
     let start_time = Instant::now();
     

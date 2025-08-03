@@ -6,13 +6,13 @@
 use std::fs::{self, File};
 use std::path::Path;
 use std::io::{Read, Write, BufReader, BufWriter, Seek};
-use anyhow::{Result, Context, bail};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tar::Builder;
 use zstd;
 
 use crate::crypto::*;
+use crate::error::{SecifyError, Result};
 
 /// Size of the read buffer for streaming operations
 const STREAM_BUFFER_SIZE: usize = 64 * 1024; // 64KB
@@ -105,7 +105,7 @@ impl<W: Write> StreamingEncryptionWriter<W> {
         hmac_key.extend_from_slice(&key);
         hmac_key.extend_from_slice(salt);
         let hmac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create HMAC: {}", e))?;
+            .map_err(|e| SecifyError::crypto(format!("Failed to create HMAC: {}", e)))?;
         
         Ok(Self {
             inner,
@@ -221,8 +221,8 @@ impl<R: Read> StreamingDecryptionReader<R> {
         hmac_key.extend_from_slice(&key);
         hmac_key.extend_from_slice(salt);
         let hmac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create HMAC: {}", e))?;
-        
+            .map_err(|e| SecifyError::crypto(format!("Failed to create HMAC: {}", e)))?;
+
         Ok(Self {
             inner,
             algorithm,
@@ -255,7 +255,7 @@ impl<R: Read> StreamingDecryptionReader<R> {
             match self.inner.read(&mut encrypted_chunk[bytes_read..]) {
                 Ok(0) => break, // EOF
                 Ok(n) => bytes_read += n,
-                Err(e) => return Err(anyhow::anyhow!("Failed to read encrypted chunk: {}", e)),
+                Err(e) => return Err(SecifyError::Io(e)),
             }
         }
         
@@ -296,7 +296,7 @@ impl<R: Read> StreamingDecryptionReader<R> {
                         let bytes_to_process = (self.file_size - self.total_read).min(n as u64) as usize;
                         self.total_read += bytes_to_process as u64;
                     }
-                    Err(e) => return Err(anyhow::anyhow!("Failed to read remaining data: {}", e)),
+                    Err(e) => return Err(SecifyError::Io(e)),
                 }
             }
         }
@@ -308,12 +308,12 @@ impl<R: Read> StreamingDecryptionReader<R> {
             match self.inner.read(&mut self.hmac_buffer[hmac_bytes_read..]) {
                 Ok(0) => break,
                 Ok(n) => hmac_bytes_read += n,
-                Err(e) => return Err(anyhow::anyhow!("Failed to read HMAC: {}", e)),
+                Err(e) => return Err(SecifyError::Io(e)),
             }
         }
         
         if hmac_bytes_read != HMAC_SIZE {
-            return Err(anyhow::anyhow!("Incomplete HMAC read: expected {} bytes, got {}", HMAC_SIZE, hmac_bytes_read));
+            return Err(SecifyError::authentication(format!("Incomplete HMAC read: expected {} bytes, got {}", HMAC_SIZE, hmac_bytes_read)));
         }
         
         // Verify HMAC
@@ -474,7 +474,7 @@ where
 {
     let input_path_obj = Path::new(input_path);
     if !input_path_obj.exists() {
-        bail!("Input path does not exist: {}", input_path);
+        return Err(SecifyError::file_error(format!("Input path does not exist: {}", input_path)));
     }
     let is_directory = input_path_obj.is_dir();
 
@@ -496,7 +496,7 @@ where
 
     // Create output file
     let output_file = File::create(output_path)
-        .with_context(|| format!("Failed to create output file: {}", output_path))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to create output file {}: {}", output_path, e)))?;
     let mut buffered_output = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
 
     // Write header length and header
@@ -527,10 +527,10 @@ where
         }
         
         // Finalize the pipeline: TAR → Compression → Encryption → Output
-        let compression_writer = tar_builder.into_inner().context("Failed to finish TAR archive")?;
+        let compression_writer = tar_builder.into_inner().map_err(|e| SecifyError::archive(format!("Failed to finish TAR archive: {}", e)))?;
         let encryption_writer = compression_writer.finalize()?;
         let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
-        final_output.flush().context("Failed to flush output file")?;
+        final_output.flush().map_err(|e| SecifyError::Io(e))?;
     } else {
         let mut tar_builder = Builder::new(encryption_writer);
         
@@ -542,9 +542,9 @@ where
         }
         
         // Finalize the pipeline: TAR → Encryption → Output
-        let encryption_writer = tar_builder.into_inner().context("Failed to finish TAR archive")?;
+        let encryption_writer = tar_builder.into_inner().map_err(|e| SecifyError::archive(format!("Failed to finish TAR archive: {}", e)))?;
         let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
-        final_output.flush().context("Failed to flush output file")?;
+        final_output.flush().map_err(|e| SecifyError::Io(e))?;
     }
 
     progress_callback(EncryptProgress::EncryptionComplete);
@@ -571,27 +571,27 @@ where
 {
     // Open encrypted file and buffer for streaming
     let file = File::open(input_path)
-        .with_context(|| format!("Failed to open encrypted file: {}", input_path))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to open encrypted file {}: {}", input_path, e)))?;
     let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
 
     // Read CBOR header length (first 4 bytes)
     let mut header_length_bytes = [0u8; 4];
     reader.read_exact(&mut header_length_bytes)
-        .with_context(|| format!("Failed to read CBOR header length from: {}", input_path))?;
+        .map_err(|e| SecifyError::invalid_format(format!("Failed to read CBOR header length from {}: {}", input_path, e)))?;
     let header_length = u32::from_le_bytes(header_length_bytes) as usize;
 
     // Validate header length
     if header_length == 0 {
-        bail!("Invalid CBOR header: header length is zero");
+        return Err(SecifyError::invalid_format("Invalid CBOR header: header length is zero"));
     }
     if header_length > MAX_HEADER_SIZE {
-        bail!("CBOR header too large: {} bytes (maximum: {})", header_length, MAX_HEADER_SIZE);
+        return Err(SecifyError::invalid_format(format!("CBOR header too large: {} bytes (maximum: {})", header_length, MAX_HEADER_SIZE)));
     }
 
     // Read CBOR header data
     let mut cbor_header_data = vec![0u8; header_length];
     reader.read_exact(&mut cbor_header_data)
-        .with_context(|| "Failed to read CBOR header data")?;
+        .map_err(|e| SecifyError::invalid_format(format!("Failed to read CBOR header data: {}", e)))?;
 
     // Deserialize and validate header
     let header = deserialize_header_from_cbor(&cbor_header_data)?;
@@ -612,7 +612,7 @@ where
     
     // Get file size to calculate ciphertext size
     let file_metadata = std::fs::metadata(input_path)
-        .with_context(|| format!("Failed to get file metadata: {}", input_path))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to get file metadata for {}: {}", input_path, e)))?;
     let total_file_size = file_metadata.len();
     let ciphertext_size = total_file_size - 4 - header_length as u64; // Subtract header length and header data
     
@@ -656,7 +656,7 @@ where
             CompressionAlgorithm::Zstd => {
                 log_callback("Setting up streaming decompression with zstd...");
                 Box::new(zstd::Decoder::new(progress_reader)
-                    .context("Failed to create zstd decoder")?)
+                    .map_err(|e| SecifyError::decompression(format!("Failed to create zstd decoder: {}", e)))?)
             }
         }
     } else {
@@ -669,18 +669,18 @@ where
     
     // Check if output already exists
     if Path::new(output_path).exists() {
-        bail!("Output path already exists: {}", output_path);
+        return Err(SecifyError::file_error(format!("Output path already exists: {}", output_path)));
     }
     
     // Get TAR entries to determine extraction strategy
     let entries = tar_archive.entries()
-        .context("Failed to read TAR entries")?;
+        .map_err(|e| SecifyError::archive(format!("Failed to read TAR entries: {}", e)))?;
     
     // Collect first few entries to determine if it's a single file
     let mut entry_count = 0;
     
     for entry in entries {
-        let _entry = entry.context("Failed to read TAR entry")?;
+        let _entry = entry.map_err(|e| SecifyError::archive(format!("Failed to read TAR entry: {}", e)))?;
         entry_count += 1;
         
         // If we have more than 1 entry, treat as directory
@@ -691,7 +691,7 @@ where
     
     // We need to create a new reader since we consumed the first one
     let file2 = File::open(input_path)
-        .with_context(|| format!("Failed to reopen encrypted file: {}", input_path))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to reopen encrypted file {}: {}", input_path, e)))?;
     let mut reader2 = BufReader::with_capacity(STREAM_BUFFER_SIZE, file2);
     
     // Skip header again
@@ -717,7 +717,7 @@ where
             CompressionAlgorithm::None => Box::new(progress_reader2),
             CompressionAlgorithm::Zstd => {
                 Box::new(zstd::Decoder::new(progress_reader2)
-                    .context("Failed to create zstd decoder")?)
+                    .map_err(|e| SecifyError::decompression(format!("Failed to create zstd decoder: {}", e)))?)
             }
         }
     } else {
@@ -737,24 +737,24 @@ where
         // Single file in TAR - extract to the output path directly
         let mut entries = tar_archive2.entries()?;
         if let Some(entry) = entries.next() {
-            let mut entry = entry.context("Failed to read TAR entry")?;
+            let mut entry = entry.map_err(|e| SecifyError::archive(format!("Failed to read TAR entry: {}", e)))?;
             let mut output_file = File::create(output_path)
-                .with_context(|| format!("Failed to create output file: {}", output_path))?;
+                .map_err(|e| SecifyError::file_error(format!("Failed to create output file {}: {}", output_path, e)))?;
             
             std::io::copy(&mut entry, &mut output_file)
-                .context("Failed to extract file from TAR")?;
+                .map_err(|e| SecifyError::archive(format!("Failed to extract file from TAR: {}", e)))?;
             
             log_callback(&format!("File extracted successfully: {}", output_path));
         } else {
-            bail!("TAR archive is empty");
+            return Err(SecifyError::archive("TAR archive is empty"));
         }
     } else {
         // Multiple files/directories - extract to directory
         fs::create_dir_all(output_path)
-            .with_context(|| format!("Failed to create output directory: {}", output_path))?;
+            .map_err(|e| SecifyError::file_error(format!("Failed to create output directory {}: {}", output_path, e)))?;
         
         tar_archive2.unpack(output_path)
-            .with_context(|| format!("Failed to extract TAR archive to: {}", output_path))?;
+            .map_err(|e| SecifyError::archive(format!("Failed to extract TAR archive to {}: {}", output_path, e)))?;
         
         log_callback(&format!("Directory decrypted and extracted successfully: {}", output_path));
     }
@@ -764,19 +764,19 @@ where
     
     // Read HMAC from the end of the original file
     let mut hmac_file = File::open(input_path)
-        .with_context(|| format!("Failed to reopen file for HMAC verification: {}", input_path))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to reopen file for HMAC verification {}: {}", input_path, e)))?;
     
     // Seek to HMAC position (last 32 bytes)
     hmac_file.seek(std::io::SeekFrom::End(-(HMAC_SIZE as i64)))
-        .context("Failed to seek to HMAC position")?;
+        .map_err(|e| SecifyError::Io(e))?;
     
     let mut stored_hmac = vec![0u8; HMAC_SIZE];
     hmac_file.read_exact(&mut stored_hmac)
-        .context("Failed to read stored HMAC")?;
+        .map_err(|e| SecifyError::authentication(format!("Failed to read stored HMAC: {}", e)))?;
     
     // Compute expected HMAC by re-reading and decrypting the entire file
     let verification_file = File::open(input_path)
-        .with_context(|| format!("Failed to open file for HMAC verification: {}", input_path))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to open file for HMAC verification {}: {}", input_path, e)))?;
     let mut verification_reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, verification_file);
     
     // Skip header
@@ -801,13 +801,13 @@ where
         match hmac_verification_reader.read(&mut temp_buffer) {
             Ok(0) => break, // EOF
             Ok(_) => continue, // Keep reading to build HMAC
-            Err(e) => return Err(anyhow::anyhow!("Failed to read for HMAC verification: {}", e)),
+            Err(e) => return Err(SecifyError::Io(e)),
         }
     }
     
     // Now verify the HMAC
     if !hmac_verification_reader.verify_hmac(&stored_hmac)? {
-        bail!("File integrity verification failed - file may be corrupted or tampered with");
+        return Err(SecifyError::authentication("File integrity verification failed - file may be corrupted or tampered with"));
     }
     
     log_callback("File integrity verified successfully");
@@ -880,7 +880,7 @@ where
 {
     let file_name = input_path.file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("Invalid file name"))?;
+        .ok_or_else(|| SecifyError::file_error("Invalid file name"))?;
     
     progress_callback(EncryptProgress::ProcessingFile { 
         current: 1, 
@@ -889,9 +889,9 @@ where
     });
     
     let mut file = File::open(input_path)
-        .with_context(|| format!("Failed to open file: {:?}", input_path))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to open file {:?}: {}", input_path, e)))?;
     tar_builder.append_file(file_name, &mut file)
-        .with_context(|| format!("Failed to add file to tar: {}", file_name))?;
+        .map_err(|e| SecifyError::archive(format!("Failed to add file to tar {}: {}", file_name, e)))?;
     Ok(())
 }
 
@@ -899,10 +899,10 @@ where
 fn count_files_in_directory_core(dir_path: &Path) -> Result<u64> {
     let mut count = 0;
     let entries = fs::read_dir(dir_path)
-        .with_context(|| format!("Failed to read directory: {}", dir_path.display()))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to read directory {}: {}", dir_path.display(), e)))?;
     
     for entry in entries {
-        let entry = entry.context("Failed to read directory entry")?;
+        let entry = entry.map_err(|e| SecifyError::file_error(format!("Failed to read directory entry: {}", e)))?;
         let path = entry.path();
         
         if path.is_dir() {
@@ -926,18 +926,18 @@ fn stream_tar_directory_recursive_core<W: Write>(
 ) -> Result<()>
 {
     let entries = fs::read_dir(current_path)
-        .with_context(|| format!("Failed to read directory: {}", current_path.display()))?;
+        .map_err(|e| SecifyError::file_error(format!("Failed to read directory {}: {}", current_path.display(), e)))?;
     
     for entry in entries {
-        let entry = entry.context("Failed to read directory entry")?;
+        let entry = entry.map_err(|e| SecifyError::file_error(format!("Failed to read directory entry: {}", e)))?;
         let path = entry.path();
         let relative_path = path.strip_prefix(base_path)
-            .context("Failed to create relative path")?;
+            .map_err(|e| SecifyError::file_error(format!("Failed to create relative path: {}", e)))?;
         
         if path.is_dir() {
             // Add directory to TAR
             tar.append_dir(relative_path, &path)
-                .with_context(|| format!("Failed to add directory to tar: {}", relative_path.display()))?;
+                .map_err(|e| SecifyError::archive(format!("Failed to add directory to tar {}: {}", relative_path.display(), e)))?;
             
             // Update progress
             *processed_files += 1;
@@ -952,10 +952,10 @@ fn stream_tar_directory_recursive_core<W: Write>(
         } else {
             // Add file to TAR with streaming
             let mut file = File::open(&path)
-                .with_context(|| format!("Failed to open file: {}", path.display()))?;
+                .map_err(|e| SecifyError::file_error(format!("Failed to open file {}: {}", path.display(), e)))?;
             
             tar.append_file(relative_path, &mut file)
-                .with_context(|| format!("Failed to add file to tar: {}", relative_path.display()))?;
+                .map_err(|e| SecifyError::archive(format!("Failed to add file to tar {}: {}", relative_path.display(), e)))?;
             
             // Update progress
             *processed_files += 1;
@@ -978,15 +978,15 @@ fn create_streaming_chunk_nonce(algorithm: &EncryptionAlgorithm, base_nonce: &[u
     match algorithm {
         EncryptionAlgorithm::Aes256Gcm | EncryptionAlgorithm::ChaCha20Poly1305 => {
             if base_nonce.len() != 8 {
-                bail!("Base nonce for {}/ChaCha20 must be 8 bytes, got {}", 
-                      algorithm.to_string(), base_nonce.len());
+                return Err(SecifyError::invalid_config(format!("Base nonce for {}/ChaCha20 must be 8 bytes, got {}", 
+                      algorithm.to_string(), base_nonce.len())));
             }
             chunk_nonce[..8].copy_from_slice(base_nonce);
             chunk_nonce[8..12].copy_from_slice(&(chunk_counter as u32).to_le_bytes());
         }
         EncryptionAlgorithm::XChaCha20Poly1305 => {
             if base_nonce.len() != 16 {
-                bail!("Base nonce for XChaCha20 must be 16 bytes, got {}", base_nonce.len());
+                return Err(SecifyError::invalid_config(format!("Base nonce for XChaCha20 must be 16 bytes, got {}", base_nonce.len())));
             }
             chunk_nonce[..16].copy_from_slice(base_nonce);
             chunk_nonce[16..24].copy_from_slice(&chunk_counter.to_le_bytes());
