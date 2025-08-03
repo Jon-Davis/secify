@@ -10,11 +10,7 @@ This is just a personal project, to explore different encryption methods.
 - **Multiple Encryption Algorithms**: AES-256-GCM, ChaCha20-Poly1305, and XChaCha20-Poly1305
 - **Optional Compression**: Zstandard (zstd) compression enabled by default (level 3) for smaller encrypted files
 - **Directory Support**: Encrypts entire folders while preserving structure
-- **Future-Proof**: Extensible Protocol Buffer header format for algorithm upgrades
 - **Fully Streaming Architecture**: Process files of any size with constant memory usage
-  - No temporary files or full-data buffering required
-  - Enables encryption of arbitrarily large files and directories
-  - Real-time processing: data flows directly from read → tar → compress → encrypt → write
   
 ### Algorithm Selection
 - **XChaCha20-Poly1305** (default): 192-bit nonce prevents collisions
@@ -66,13 +62,15 @@ The `.sec` format is a binary container with the following structure:
 ├─────────────────────────────────────────────────────────────┤
 │ Header Length    │ 4 bytes (little-endian u32)              │
 ├─────────────────────────────────────────────────────────────┤
-│ Protobuf Header  │ Variable length (self-describing)        │
+│ Protobuf Header  │ Variable length                          │
 ├─────────────────────────────────────────────────────────────┤
 │ Encrypted Data   │ Variable length (optionally compressed)  │
 ├─────────────────────────────────────────────────────────────┤
 │ File HMAC        │ 32 bytes (HMAC-SHA256 of plaintext)      │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+The format was inspired by JWT, following a header, payload, signature style.
 
 ### Protocol Buffer Header Structure
 
@@ -84,7 +82,7 @@ The header contains all encryption metadata in Protocol Buffer format:
   "encryption_algorithm": "AES-256-GCM",  // Encryption method
   "compression": {                        // Optional compression configuration
     "algorithm": "zstd",                  // Compression algorithm (if used)
-    "level": 3                           // Compression level (default: 3)
+    "level": 3                            // Compression level (default: 3)
   },
   "kdf": {                                // Key derivation function
     "algorithm": "Argon2id",
@@ -146,75 +144,3 @@ The `.sec` format provides comprehensive integrity protection through multiple l
 - 32-byte HMAC-SHA256 appended to the end of the file
 - Computed over the original plaintext data using the encryption key
 - Verified after successful decryption of all chunks
-
-## Examples
-
-### Encrypting a Folder
-```bash
-$ secify
-=== Secify Interactive Mode ===
-
-Enter the file or directory path (type 'ls' to list files): test_dir
-Detected non-.sec file - will encrypt
-
-Select encryption algorithm:
-1. AES-256-GCM (hardware accelerated on most CPUs, 96-bit nonce)
-2. ChaCha20-Poly1305 (faster on mobile/older CPUs, 96-bit nonce)
-3. XChaCha20-Poly1305 (default, recommended for high-volume use, 192-bit nonce)
-Enter choice (1, 2, or 3, default is 3):
-
-Argon2id Key Derivation Settings:
-Current: 128MB memory, 8 iterations, 4 threads
-Customize Argon2 parameters? (y/N):
-
-Compression Settings:
-Select compression algorithm:
-1. None (faster encryption, larger files)
-2. Zstandard (zstd) (slower encryption, smaller files)
-Enter choice (1 or 2, default is 1): 2
-Compression level (1-22, default: 3, higher = better compression but slower): 3
-
-Enter password for encryption: 
-
-Confirm password:
-
-
-Encrypting file...
-Using TAR archive format with compression and full streaming pipeline (read→tar→compress→encrypt→write)
-Streaming directory encryption with compression and full pipeline (TAR → Compress → Encrypt)...
-Deriving encryption key with Argon2id (128MB, 8 iterations, 4 threads)...
-Argon2 key derivation completed in 0.49 seconds
-Counting files...
-  Streaming TAR [00:00:00] [########################################] 4/4 Streaming directory encryption complete                                                                                                                  
-Directory encrypted successfully: test_dir.sec
-```
-
-### Decrypting a Folder
-```bash
-$ secify
-=== Secify Interactive Mode ===
-
-Enter the file or directory path (type 'ls' to list files): test_dir.sec
-Detected .sec file - will decrypt
-Enter password for decryption:
-
-
-Decrypting file...
-TAR archive detected - using streaming decryption
-File format version: 1
-Encryption: XChaCha20-Poly1305
-Compression: zstd (level 6)
-Key derivation: Argon2id (128MB, 8 iterations, 4 threads)
-Chunked encryption: 64KB chunks
-Deriving encryption key with Argon2id (128MB, 8 iterations, 4 threads)...
-Argon2 key derivation completed in 0.49 seconds
-Decrypting data...
-  Decrypting [00:00:00] [########################################] 4.52 KiB/4.52 KiB (12.17 MiB/s, 0s)                                                                                                                             
-Verifying file integrity...
-File integrity verified successfully
-Decompressing data with zstd...
-Extracting TAR directory...
-Extracting TAR archive...
-  Extracting TAR [00:00:00] [########################################] 4/4 TAR extraction complete!                                                                                                                                
-Directory decrypted and extracted successfully: test_dir
-```
