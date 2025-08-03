@@ -490,8 +490,9 @@ where
     let base_nonce = generate_base_nonce(algorithm)?;
     let key = derive_key_with_callback(password, &salt, argon2_params, log_callback)?;
 
-    // Create header - always mark as TAR format
-    let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32, compression.clone());
+    // Create header - only use TAR format for directories
+    let archive_format = if is_directory { Some("tar".to_string()) } else { None };
+    let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32, compression.clone(), archive_format);
     let cbor_header = serialize_header_to_cbor(&header)?;
 
     // Create output file
@@ -504,7 +505,7 @@ where
     buffered_output.write_all(&cbor_header)?;
 
     // Create streaming encryption wrapper
-    let encryption_writer = StreamingEncryptionWriter::new(
+    let mut encryption_writer = StreamingEncryptionWriter::new(
         buffered_output,
         algorithm.clone(),
         key,
@@ -514,37 +515,74 @@ where
 
     progress_callback(EncryptProgress::EncryptionStarted);
 
-    // Create writer chain based on compression setting
-    if compression.is_some() {
-        let compression_writer = CompressionBufferingWriter::new(encryption_writer, compression.as_ref())?;
-        let mut tar_builder = Builder::new(compression_writer);
-        
-        // Process input (file or directory)
-        if is_directory {
+    // Handle encryption based on whether we need TAR format or not
+    if header.archive.is_some() {
+        // Directory: Use TAR format with compression pipeline
+        if compression.is_some() {
+            let compression_writer = CompressionBufferingWriter::new(encryption_writer, compression.as_ref())?;
+            let mut tar_builder = Builder::new(compression_writer);
+            
+            // Process directory
             process_directory_core(input_path_obj, &mut tar_builder, &progress_callback)?;
+            
+            // Finalize the pipeline: TAR → Compression → Encryption → Output
+            let compression_writer = tar_builder.into_inner().map_err(|e| SecifyError::archive(format!("Failed to finish TAR archive: {}", e)))?;
+            let encryption_writer = compression_writer.finalize()?;
+            let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
+            final_output.flush().map_err(|e| SecifyError::Io(e))?;
         } else {
-            process_file_core(input_path_obj, &mut tar_builder, &progress_callback)?;
+            let mut tar_builder = Builder::new(encryption_writer);
+            
+            // Process directory
+            process_directory_core(input_path_obj, &mut tar_builder, &progress_callback)?;
+            
+            // Finalize the pipeline: TAR → Encryption → Output
+            let encryption_writer = tar_builder.into_inner().map_err(|e| SecifyError::archive(format!("Failed to finish TAR archive: {}", e)))?;
+            let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
+            final_output.flush().map_err(|e| SecifyError::Io(e))?;
         }
-        
-        // Finalize the pipeline: TAR → Compression → Encryption → Output
-        let compression_writer = tar_builder.into_inner().map_err(|e| SecifyError::archive(format!("Failed to finish TAR archive: {}", e)))?;
-        let encryption_writer = compression_writer.finalize()?;
-        let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
-        final_output.flush().map_err(|e| SecifyError::Io(e))?;
     } else {
-        let mut tar_builder = Builder::new(encryption_writer);
-        
-        // Process input (file or directory)
-        if is_directory {
-            process_directory_core(input_path_obj, &mut tar_builder, &progress_callback)?;
+        // Single file: Direct streaming without TAR overhead
+        if compression.is_some() {
+            let mut compression_writer = CompressionBufferingWriter::new(encryption_writer, compression.as_ref())?;
+            
+            // Stream file content directly to compression then encryption
+            let mut file = File::open(input_path_obj)
+                .map_err(|e| SecifyError::file_error(format!("Failed to open file {:?}: {}", input_path_obj, e)))?;
+            
+            progress_callback(EncryptProgress::ProcessingFile { 
+                current: 1, 
+                total: 1, 
+                name: input_path_obj.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown").to_string()
+            });
+            
+            std::io::copy(&mut file, &mut compression_writer)?;
+            
+            // Finalize the pipeline: Compression → Encryption → Output
+            let encryption_writer = compression_writer.finalize()?;
+            let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
+            final_output.flush().map_err(|e| SecifyError::Io(e))?;
         } else {
-            process_file_core(input_path_obj, &mut tar_builder, &progress_callback)?;
+            // Direct file streaming to encryption
+            let mut file = File::open(input_path_obj)
+                .map_err(|e| SecifyError::file_error(format!("Failed to open file {:?}: {}", input_path_obj, e)))?;
+            
+            progress_callback(EncryptProgress::ProcessingFile { 
+                current: 1, 
+                total: 1, 
+                name: input_path_obj.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown").to_string()
+            });
+            
+            std::io::copy(&mut file, &mut encryption_writer)?;
+            
+            // Finalize encryption
+            let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
+            final_output.flush().map_err(|e| SecifyError::Io(e))?;
         }
-        
-        // Finalize the pipeline: TAR → Encryption → Output
-        let encryption_writer = tar_builder.into_inner().map_err(|e| SecifyError::archive(format!("Failed to finish TAR archive: {}", e)))?;
-        let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
-        final_output.flush().map_err(|e| SecifyError::Io(e))?;
     }
 
     progress_callback(EncryptProgress::EncryptionComplete);
@@ -649,7 +687,7 @@ where
     let progress_reader = ProgressAwareReader::new(decryption_reader, ciphertext_size, &progress_callback);
     
     // Create decompression reader if needed
-    let decompressed_reader: Box<dyn Read> = if let Some(ref compression) = header.compression {
+    let mut decompressed_reader: Box<dyn Read> = if let Some(ref compression) = header.compression {
         let compression_alg = CompressionAlgorithm::from_string(&compression.algorithm)?;
         match compression_alg {
             CompressionAlgorithm::None => Box::new(progress_reader),
@@ -663,100 +701,51 @@ where
         Box::new(progress_reader)
     };
     
-    // Create TAR archive from the streaming reader and extract directly
-    log_callback("Setting up streaming TAR extraction...");
-    let mut tar_archive = tar::Archive::new(decompressed_reader);
-    
     // Check if output already exists
     if Path::new(output_path).exists() {
         return Err(SecifyError::file_error(format!("Output path already exists: {}", output_path)));
     }
-    
-    // Get TAR entries to determine extraction strategy
-    let entries = tar_archive.entries()
-        .map_err(|e| SecifyError::archive(format!("Failed to read TAR entries: {}", e)))?;
-    
-    // Collect first few entries to determine if it's a single file
-    let mut entry_count = 0;
-    
-    for entry in entries {
-        let _entry = entry.map_err(|e| SecifyError::archive(format!("Failed to read TAR entry: {}", e)))?;
-        entry_count += 1;
-        
-        // If we have more than 1 entry, treat as directory
-        if entry_count > 1 {
-            break;
-        }
-    }
-    
-    // We need to create a new reader since we consumed the first one
-    let file2 = File::open(input_path)
-        .map_err(|e| SecifyError::file_error(format!("Failed to reopen encrypted file {}: {}", input_path, e)))?;
-    let mut reader2 = BufReader::with_capacity(STREAM_BUFFER_SIZE, file2);
-    
-    // Skip header again
-    reader2.read_exact(&mut [0u8; 4])?; // header length
-    let mut cbor_skip = vec![0u8; header_length];
-    reader2.read_exact(&mut cbor_skip)?;
-    
-    let decryption_reader2 = StreamingDecryptionReader::new(
-        reader2,
-        algorithm,
-        key,
-        header.nonce.clone(),
-        &header.salt,
-        ciphertext_size,
-    )?;
-    
-    // Wrap the second reader with progress tracking since this is where the actual work happens
-    let progress_reader2 = ProgressAwareReader::new(decryption_reader2, ciphertext_size, &progress_callback);
-    
-    let final_reader: Box<dyn Read> = if let Some(ref compression) = header.compression {
-        let compression_alg = CompressionAlgorithm::from_string(&compression.algorithm)?;
-        match compression_alg {
-            CompressionAlgorithm::None => Box::new(progress_reader2),
-            CompressionAlgorithm::Zstd => {
-                Box::new(zstd::Decoder::new(progress_reader2)
-                    .map_err(|e| SecifyError::decompression(format!("Failed to create zstd decoder: {}", e)))?)
-            }
-        }
-    } else {
-        Box::new(progress_reader2)
-    };
-    
-    let mut tar_archive2 = tar::Archive::new(final_reader);
-    
-    // Report extraction strategy
-    let progress_callback_ref = &progress_callback;
-    progress_callback_ref(DecryptProgress::ExtractionStrategy {
-        is_single_file: entry_count == 1,
-        output_path: output_path.to_string(),
-    });
-    
-    if entry_count == 1 {
-        // Single file in TAR - extract to the output path directly
-        let mut entries = tar_archive2.entries()?;
-        if let Some(entry) = entries.next() {
-            let mut entry = entry.map_err(|e| SecifyError::archive(format!("Failed to read TAR entry: {}", e)))?;
-            let mut output_file = File::create(output_path)
-                .map_err(|e| SecifyError::file_error(format!("Failed to create output file {}: {}", output_path, e)))?;
+
+    // Handle extraction based on archive format
+    if let Some(ref archive_format) = header.archive {
+        if archive_format == "tar" {
+            // TAR archive format (directory)
+            log_callback("Setting up streaming TAR extraction...");
+            let mut tar_archive = tar::Archive::new(decompressed_reader);
             
-            std::io::copy(&mut entry, &mut output_file)
-                .map_err(|e| SecifyError::archive(format!("Failed to extract file from TAR: {}", e)))?;
+            // Report extraction strategy as directory
+            progress_callback(DecryptProgress::ExtractionStrategy {
+                is_single_file: false,
+                output_path: output_path.to_string(),
+            });
             
-            log_callback(&format!("File extracted successfully: {}", output_path));
+            // Extract entire TAR archive to directory
+            fs::create_dir_all(output_path)
+                .map_err(|e| SecifyError::file_error(format!("Failed to create output directory {}: {}", output_path, e)))?;
+            
+            tar_archive.unpack(output_path)
+                .map_err(|e| SecifyError::archive(format!("Failed to extract TAR archive: {}", e)))?;
+            
+            log_callback(&format!("Directory decrypted and extracted successfully: {}", output_path));
         } else {
-            return Err(SecifyError::archive("TAR archive is empty"));
+            return Err(SecifyError::invalid_format(format!("Unsupported archive format: {}", archive_format)));
         }
     } else {
-        // Multiple files/directories - extract to directory
-        fs::create_dir_all(output_path)
-            .map_err(|e| SecifyError::file_error(format!("Failed to create output directory {}: {}", output_path, e)))?;
+        // Single file format (no TAR)
+        // Report extraction strategy as single file
+        progress_callback(DecryptProgress::ExtractionStrategy {
+            is_single_file: true,
+            output_path: output_path.to_string(),
+        });
         
-        tar_archive2.unpack(output_path)
-            .map_err(|e| SecifyError::archive(format!("Failed to extract TAR archive to {}: {}", output_path, e)))?;
+        // Stream directly to output file
+        let mut output_file = File::create(output_path)
+            .map_err(|e| SecifyError::file_error(format!("Failed to create output file {}: {}", output_path, e)))?;
         
-        log_callback(&format!("Directory decrypted and extracted successfully: {}", output_path));
+        std::io::copy(&mut decompressed_reader, &mut output_file)
+            .map_err(|e| SecifyError::file_error(format!("Failed to write decrypted data: {}", e)))?;
+        
+        log_callback(&format!("File decrypted successfully: {}", output_path));
     }
     
     // Verify HMAC for file integrity after extraction is complete
@@ -867,31 +856,6 @@ where
         &mut processed_files,
         &progress_callback,
     )?;
-    Ok(())
-}
-
-fn process_file_core<W: Write, P>(
-    input_path: &Path,
-    tar_builder: &mut Builder<W>,
-    progress_callback: P,
-) -> Result<()>
-where
-    P: Fn(EncryptProgress),
-{
-    let file_name = input_path.file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| SecifyError::file_error("Invalid file name"))?;
-    
-    progress_callback(EncryptProgress::ProcessingFile { 
-        current: 1, 
-        total: 1, 
-        name: file_name.to_string() 
-    });
-    
-    let mut file = File::open(input_path)
-        .map_err(|e| SecifyError::file_error(format!("Failed to open file {:?}: {}", input_path, e)))?;
-    tar_builder.append_file(file_name, &mut file)
-        .map_err(|e| SecifyError::archive(format!("Failed to add file to tar {}: {}", file_name, e)))?;
     Ok(())
 }
 

@@ -172,6 +172,8 @@ pub struct EncryptionHeader {
     pub chunk_size: u32,
     /// Optional compression configuration
     pub compression: Option<CompressionConfig>,
+    /// Optional archive format (only present for directories)
+    pub archive: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -386,7 +388,7 @@ pub fn decrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENG
     Ok(result)
 }
 
-pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32, compression: Option<CompressionConfig>) -> EncryptionHeader {
+pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32, compression: Option<CompressionConfig>, archive: Option<String>) -> EncryptionHeader {
     EncryptionHeader {
         version: FILE_FORMAT_VERSION,
         encryption_algorithm: algorithm.to_string().to_owned(),
@@ -402,6 +404,7 @@ pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &Encryptio
         nonce: nonce.to_vec(),
         chunk_size,
         compression,
+        archive,
     }
 }
 
@@ -720,8 +723,8 @@ mod tests {
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
         
-        // Test file header with chunked encryption
-        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        // Test file header (no archive field for single files)
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         assert_eq!(header.version, FILE_FORMAT_VERSION);
         assert_eq!(header.encryption_algorithm, "XChaCha20-Poly1305");
         assert_eq!(header.kdf.algorithm, "Argon2id");
@@ -731,10 +734,12 @@ mod tests {
         assert_eq!(header.salt, salt.to_vec());
         assert_eq!(header.nonce, base_nonce);
         assert_eq!(header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
+        assert_eq!(header.archive, None); // Single file has no archive field
         
-        // All headers are now archives in TAR format
-        let archive_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        // Test directory header with TAR archive format
+        let archive_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, Some("tar".to_string()));
         assert_eq!(archive_header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
+        assert_eq!(archive_header.archive, Some("tar".to_string())); // Directory has tar archive field
     }
 
     #[test]
@@ -743,7 +748,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let original_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        let original_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
         // Serialize to CBOR
         let cbor_data = serialize_header_to_cbor(&original_header).unwrap();
@@ -768,7 +773,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
         // Valid header should pass validation
         assert!(validate_header(&header).is_ok());
@@ -780,7 +785,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
         // Set invalid version
         header.version = FILE_FORMAT_VERSION + 1;
@@ -793,7 +798,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
         // Set invalid algorithm
         header.encryption_algorithm = "Invalid-Algorithm".to_string();
@@ -806,7 +811,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
         // Set invalid KDF
         header.kdf.algorithm = "PBKDF2".to_string();
@@ -819,7 +824,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
         // Set invalid salt length
         header.salt = vec![1u8; 16]; // Wrong length
@@ -832,7 +837,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
         
         // Set invalid nonce length (AES-GCM expects 8-byte base nonce, so use 4 bytes to make it invalid)
         header.nonce = vec![2u8; 4]; // Wrong length for AES-GCM base nonce
@@ -1178,7 +1183,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, 0, None);
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, 0, None, None);
         
         // Zero chunk size should be invalid
         assert!(validate_header(&header).is_err());
@@ -1196,7 +1201,7 @@ mod tests {
             let salt = create_test_salt();
             let base_nonce = create_test_base_nonce(algorithm);
             let params = create_fast_test_params();
-            let original_header = create_encryption_header(&salt, &base_nonce, algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
+            let original_header = create_encryption_header(&salt, &base_nonce, algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
             
             // Serialize and deserialize
             let cbor_data = serialize_header_to_cbor(&original_header).unwrap();
@@ -1214,16 +1219,25 @@ mod tests {
 
     #[test]
     fn test_content_type_archive_only() {
-        // Test that all headers now use TAR archive format
+        // Test that single files don't have archive field, directories do
         let algorithm = EncryptionAlgorithm::Aes256Gcm;
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None);
         
-        // Verify header was created successfully (TAR format is implicit now)
-        assert_eq!(header.version, FILE_FORMAT_VERSION);
-        assert_eq!(header.encryption_algorithm, algorithm.to_string());
+        // Single file header (no archive field)
+        let single_file_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        assert_eq!(single_file_header.archive, None);
+        
+        // Directory header (with archive field)
+        let directory_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, Some("tar".to_string()));
+        assert_eq!(directory_header.archive, Some("tar".to_string()));
+        
+        // Verify basic header fields are correct for both
+        assert_eq!(single_file_header.version, FILE_FORMAT_VERSION);
+        assert_eq!(single_file_header.encryption_algorithm, algorithm.to_string());
+        assert_eq!(directory_header.version, FILE_FORMAT_VERSION);
+        assert_eq!(directory_header.encryption_algorithm, algorithm.to_string());
     }
 
     #[test]

@@ -60,8 +60,8 @@ pub fn encrypt_with_ui(
                 match (is_directory, has_compression) {
                     (true, true) => println!("Streaming directory encryption with compression and full pipeline (TAR → Compress → Encrypt)..."),
                     (true, false) => println!("Streaming directory encryption with full pipeline (TAR → Encrypt)..."),
-                    (false, true) => println!("Streaming file encryption with compression and TAR archive format..."),
-                    (false, false) => println!("Streaming file encryption with TAR archive format..."),
+                    (false, true) => println!("Streaming file encryption with compression pipeline (Compress → Encrypt)..."),
+                    (false, false) => println!("Streaming file encryption..."),
                 }
             },
             EncryptProgress::CountingFiles => {

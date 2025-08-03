@@ -47,14 +47,14 @@ Secify uses Argon2id for key derivation with customizable parameters:
 
 Secify implements a fully streaming pipeline for optimal memory efficiency:
 
-**Read → Archive → Compress → Encrypt → Write Pipeline:**
-- **Files**: Content is read in chunks, archived via TAR, optionally compressed, then encrypted and written
+**Read → [Archive] → Compress → Encrypt → Write Pipeline:**
+- **Single Files**: Content is read in chunks, optionally compressed, then encrypted and written directly (no TAR overhead)
 - **Directories**: Files are recursively added to TAR stream, optionally compressed, encrypted on-the-fly, and written incrementally
 - **Memory Usage**: Constant memory usage regardless of file/directory size (only chunk-size buffers)
 - **Performance**: No temporary files, no full-data buffering, immediate processing of each chunk
 - **Compression**: Optional zstd compression reduces file size at the cost of CPU time
 
-This streaming approach enables encryption of arbitrarily large files and directories without memory constraints.
+This streaming approach enables encryption of arbitrarily large files and directories without memory constraints, while minimizing overhead for single files.
 
 ### Format Specification
 
@@ -96,7 +96,8 @@ The header contains all encryption metadata in CBOR format:
   },
   "salt": [32 bytes],                     // Random salt for key derivation
   "nonce": [8/16 bytes],                  // Base nonce for chunked encryption
-  "chunk_size": 65536                     // Chunk size in bytes (64KB default)
+  "chunk_size": 65536,                    // Chunk size in bytes (64KB default)
+  "archive": "tar"                        // Optional: Archive format (only present for directories)
 }
 ```
 
