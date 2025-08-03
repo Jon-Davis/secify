@@ -148,15 +148,22 @@ impl<W: Write> StreamingEncryptionWriter<W> {
         if !self.buffer.is_empty() {
             self.flush_chunk()?;
         }
-        
-        // Get final HMAC
-        let hmac_result = self.hmac.finalize();
-        let hmac_bytes = hmac_result.into_bytes().to_vec();
-        
-        // Write HMAC to the end
-        self.inner.write_all(&hmac_bytes)?;
-        
-        Ok((self.inner, hmac_bytes))
+
+        // Only write HMAC if more than one chunk was encrypted
+        // Single chunk files rely on AEAD authentication only
+        if self.chunk_counter > 1 {
+            // Get final HMAC
+            let hmac_result = self.hmac.finalize();
+            let hmac_bytes = hmac_result.into_bytes().to_vec();
+            
+            // Write HMAC to the end
+            self.inner.write_all(&hmac_bytes)?;
+            
+            Ok((self.inner, hmac_bytes))
+        } else {
+            // No HMAC for single chunk - return empty HMAC bytes to indicate this
+            Ok((self.inner, Vec::new()))
+        }
     }
 }
 
@@ -216,6 +223,9 @@ impl<R: Read> StreamingDecryptionReader<R> {
     ) -> Result<Self> {
         let chunk_size = DEFAULT_CHUNK_SIZE;
         
+        // Don't subtract HMAC size initially - we'll determine if it exists during reading
+        // based on whether we have multiple chunks
+        
         // Create HMAC for integrity
         let mut hmac_key = Vec::with_capacity(KEY_LENGTH + salt.len());
         hmac_key.extend_from_slice(&key);
@@ -235,20 +245,39 @@ impl<R: Read> StreamingDecryptionReader<R> {
             hmac,
             hmac_buffer: Vec::new(),
             total_read: 0,
-            file_size: file_size.saturating_sub(HMAC_SIZE as u64), // Subtract HMAC size
+            file_size,
             finished: false,
         })
     }
     
     fn decrypt_next_chunk(&mut self) -> Result<bool> {
-        if self.finished || self.total_read >= self.file_size {
+        if self.finished {
+            return Ok(false);
+        }
+        
+        // For first chunk, read normally
+        // For subsequent chunks, we know it's multi-chunk so reserve HMAC space
+        let effective_file_size = if self.chunk_counter == 0 {
+            self.file_size
+        } else {
+            // Multi-chunk file - leave space for HMAC
+            self.file_size.saturating_sub(HMAC_SIZE as u64)
+        };
+        
+        if self.total_read >= effective_file_size {
             return Ok(false);
         }
         
         // Read next encrypted chunk
-        let mut encrypted_chunk = vec![0u8; self.chunk_size];
-        let bytes_to_read = (self.file_size - self.total_read).min(self.chunk_size as u64) as usize;
-        encrypted_chunk.resize(bytes_to_read, 0);
+        let remaining_data = effective_file_size - self.total_read;
+        let bytes_to_read = remaining_data.min(self.chunk_size as u64) as usize;
+        
+        if bytes_to_read == 0 {
+            self.finished = true;
+            return Ok(false);
+        }
+        
+        let mut encrypted_chunk = vec![0u8; bytes_to_read];
         
         let mut bytes_read = 0;
         while bytes_read < bytes_to_read {
@@ -266,6 +295,13 @@ impl<R: Read> StreamingDecryptionReader<R> {
         
         encrypted_chunk.truncate(bytes_read);
         self.total_read += bytes_read as u64;
+        
+        // After reading first chunk, check if there's significantly more data
+        // If so, this is a multi-chunk file and we should reserve HMAC space for future reads
+        if self.chunk_counter == 0 && self.total_read < self.file_size.saturating_sub(HMAC_SIZE as u64) {
+            // There's more data after this chunk, so this is multi-chunk
+            // No need to do anything special, subsequent reads will handle HMAC reservation
+        }
         
         // Create chunk nonce
         let chunk_nonce = create_streaming_chunk_nonce(&self.algorithm, &self.base_nonce, self.chunk_counter)?;
@@ -285,6 +321,12 @@ impl<R: Read> StreamingDecryptionReader<R> {
     }
     
     pub fn verify_hmac(&mut self, expected_hmac: &[u8]) -> Result<bool> {
+        // If only one chunk was processed, no HMAC verification is needed
+        // Single chunk files rely solely on AEAD authentication
+        if self.chunk_counter <= 1 {
+            return Ok(true); // Always pass verification for single chunk files
+        }
+        
         // Read any remaining HMAC bytes if we haven't finished reading the file
         if !self.finished && self.total_read < self.file_size {
             // Read and discard remaining ciphertext
@@ -653,6 +695,9 @@ where
     let file_metadata = std::fs::metadata(input_path)
         .map_err(|e| SecifyError::file_error(format!("Failed to get file metadata for {}: {}", input_path, e)))?;
     let total_file_size = file_metadata.len();
+    
+    // For now, assume worst case (HMAC present) for initial size calculation
+    // We'll adjust during verification based on actual chunk count
     let ciphertext_size = total_file_size - 4 - header_length as u64; // Subtract header length and header data
     
     // Create encryption info for progress callback
@@ -752,19 +797,8 @@ where
     // Verify HMAC for file integrity after extraction is complete
     progress_callback(DecryptProgress::VerifyingIntegrity);
     
-    // Read HMAC from the end of the original file
-    let mut hmac_file = File::open(input_path)
-        .map_err(|e| SecifyError::file_error(format!("Failed to reopen file for HMAC verification {}: {}", input_path, e)))?;
-    
-    // Seek to HMAC position (last 32 bytes)
-    hmac_file.seek(std::io::SeekFrom::End(-(HMAC_SIZE as i64)))
-        .map_err(|e| SecifyError::Io(e))?;
-    
-    let mut stored_hmac = vec![0u8; HMAC_SIZE];
-    hmac_file.read_exact(&mut stored_hmac)
-        .map_err(|e| SecifyError::authentication(format!("Failed to read stored HMAC: {}", e)))?;
-    
-    // Compute expected HMAC by re-reading and decrypting the entire file
+    // Create a new decryption reader to check if this is a single-chunk file
+    // We'll use this to determine if HMAC verification is needed
     let verification_file = File::open(input_path)
         .map_err(|e| SecifyError::file_error(format!("Failed to open file for HMAC verification {}: {}", input_path, e)))?;
     let mut verification_reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, verification_file);
@@ -785,7 +819,7 @@ where
         ciphertext_size,
     )?;
     
-    // Read all plaintext to build HMAC (this is memory-efficient as it streams)
+    // Read all plaintext to build HMAC and count chunks
     let mut temp_buffer = vec![0u8; 64 * 1024]; // 64KB buffer
     loop {
         match hmac_verification_reader.read(&mut temp_buffer) {
@@ -795,9 +829,30 @@ where
         }
     }
     
-    // Now verify the HMAC
-    if !hmac_verification_reader.verify_hmac(&stored_hmac)? {
-        return Err(SecifyError::authentication("File integrity verification failed - file may be corrupted or tampered with"));
+    // Check if this was a single chunk file
+    if hmac_verification_reader.chunk_counter <= 1 {
+        // Single chunk file - no HMAC verification needed
+        log_callback("Single chunk file detected - HMAC verification skipped (AEAD provides sufficient integrity)");
+    } else {
+        // Multi-chunk file - verify HMAC
+        // Read HMAC from the end of the original file
+        let mut hmac_file = File::open(input_path)
+            .map_err(|e| SecifyError::file_error(format!("Failed to reopen file for HMAC verification {}: {}", input_path, e)))?;
+        
+        // Seek to HMAC position (last 32 bytes)
+        hmac_file.seek(std::io::SeekFrom::End(-(HMAC_SIZE as i64)))
+            .map_err(|e| SecifyError::Io(e))?;
+        
+        let mut stored_hmac = vec![0u8; HMAC_SIZE];
+        hmac_file.read_exact(&mut stored_hmac)
+            .map_err(|e| SecifyError::authentication(format!("Failed to read stored HMAC: {}", e)))?;
+        
+        // Verify the HMAC
+        if !hmac_verification_reader.verify_hmac(&stored_hmac)? {
+            return Err(SecifyError::authentication("File integrity verification failed - file may be corrupted or tampered with"));
+        }
+        
+        log_callback("Multi-chunk file HMAC verified successfully");
     }
     
     log_callback("File integrity verified successfully");

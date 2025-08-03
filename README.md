@@ -66,11 +66,13 @@ The `.sec` format is a binary container with the following structure:
 ├─────────────────────────────────────────────────────────────┤
 │ Encrypted Data   │ Variable length (optionally compressed)  │
 ├─────────────────────────────────────────────────────────────┤
-│ File HMAC        │ 32 bytes (HMAC-SHA256 of plaintext)      │
+│ File HMAC        │ 32 bytes (HMAC-SHA256, multi-chunk only) │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 The format was inspired by JWT, following a header, payload, signature style.
+
+**Note:** Single-chunk files omit the HMAC section entirely, relying on AEAD authentication for integrity.
 
 ### Protocol Buffer Header Structure
 
@@ -141,6 +143,7 @@ The `.sec` format provides comprehensive integrity protection through multiple l
 - Enables safe streaming decryption
 
 **File-Level Integrity (HMAC):**
-- 32-byte HMAC-SHA256 appended to the end of the file
+- 32-byte HMAC-SHA256 appended to the end of multi-chunk files only
 - Computed over the original plaintext data using the encryption key
 - Verified after successful decryption of all chunks
+- **Single-chunk files skip HMAC** - AEAD authentication provides sufficient integrity protection
