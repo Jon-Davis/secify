@@ -21,21 +21,8 @@ This is just a personal project, to explore different encryption methods.
 Secify uses Argon2id for key derivation with customizable parameters:
 
 - **Memory Cost** (8-2048 MB, default: 128): Memory usage during key derivation
-  - Higher = more secure against GPU attacks, but slower and uses more RAM
-  - Recommended: 128MB for normal use, 256-512MB for high security
-
 - **Time Cost** (1-100 iterations, default: 8): Number of iterations
-  - Higher = more secure against brute force, but slower
-  - Recommended: 8 for normal use, 12-16 for high security
-
 - **Parallelism** (1-16 threads, default: 4): Number of parallel threads
-  - Should match your CPU cores for best performance
-  - Higher doesn't necessarily mean more secure
-
-**Examples:**
-- **Fast/Mobile**: `--memory-mb 32 --time-cost 4 --parallelism 2`
-- **Balanced**: `--memory-mb 128 --time-cost 8 --parallelism 4` (default)
-- **High Security**: `--memory-mb 512 --time-cost 16 --parallelism 8`
 
 ## File Format: Securely Encrypted Container (.sec)
 
@@ -44,8 +31,8 @@ Secify uses Argon2id for key derivation with customizable parameters:
 Secify implements a fully streaming pipeline for optimal memory efficiency:
 
 **Read → [Archive] → Compress → Encrypt → Write Pipeline:**
-- **Single Files**: Content is read in chunks, optionally compressed, then encrypted and written directly (no TAR overhead)
-- **Directories**: Files are recursively added to TAR stream, optionally compressed, encrypted on-the-fly, and written incrementally
+- **Single Files**: Content is read in chunks, optionally compressed, then encrypted and written directly (no archive overhead)
+- **Directories**: Files are recursively added to custom archive stream, optionally compressed, encrypted on-the-fly, and written incrementally
 - **Memory Usage**: Constant memory usage regardless of file/directory size (only chunk-size buffers)
 - **Performance**: No temporary files, no full-data buffering, immediate processing of each chunk
 - **Compression**: Optional zstd compression reduces file size at the cost of CPU time
@@ -143,6 +130,59 @@ Data is encrypted in fixed-size chunks for efficient streaming and memory usage.
 - **Last chunk**: May be smaller than `chunk_size` to accommodate remaining data
 
 Each chunk uses a unique nonce created by combining the base nonce with a chunk counter.
+
+### Sec Archive Format
+
+For directories, Secify uses a custom **sec archive format** that provides minimal overhead while preserving directory structure. This lightweight streaming format is specifically designed for efficient encryption and archival without the overhead of traditional archive formats like TAR.
+
+#### Archive Structure
+
+The sec archive format streams files sequentially with the following structure for each file entry:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Sec Archive Entry                        │
+├─────────────────────────────────────────────────────────────┤
+│ Name Length      │ 4 bytes (little-endian u32)              │
+├─────────────────────────────────────────────────────────────┤
+│ File Name        │ Variable length (UTF-8 string)           │
+├─────────────────────────────────────────────────────────────┤
+│ File Size        │ 8 bytes (little-endian u64)              │
+├─────────────────────────────────────────────────────────────┤
+│ File Data        │ Variable length (raw file content)       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Archive Benefits:**
+- **Minimal Overhead**: Only 12 bytes per file + filename length 
+- **Streaming-Friendly**: Files can be processed sequentially without seeking
+- **Path Preservation**: Full relative paths maintained for directory reconstruction
+- **No Padding**: Unlike TAR, no block-size padding waste (95% overhead reduction for small files)
+- **Natural Termination**: Archive ends when encrypted data stream ends
+
+**Directory Handling:**
+- **Recursive Processing**: All subdirectories are flattened into relative paths
+- **Path Separators**: Uses forward slashes `/` for cross-platform compatibility
+- **Metadata**: File modification times and permissions are not preserved (encryption-focused)
+- **Empty Directories**: Not explicitly stored (recreated during extraction as needed)
+
+#### Example Directory Archive
+
+For a directory structure like:
+```
+project/
+├── src/
+│   ├── main.rs
+│   └── lib.rs
+└── README.md
+```
+
+The sec archive would contain:
+```
+[12]["src/main.rs"][1024][...file data...]
+[8]["src/lib.rs"][512][...file data...]
+[9]["README.md"][256][...file data...]
+```
 
 ### File Integrity Protection
 
