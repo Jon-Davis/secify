@@ -16,12 +16,26 @@
 //! # Examples
 //! 
 //! ```rust
-//! use secify_lib::{encrypt_core, decrypt_core, EncryptionAlgorithm, Argon2Params, Result};
+//! use secify_lib::{encrypt_core, decrypt_core, EncryptionAlgorithm, Argon2Params, Result, SecifyEvent, LogLevel};
 //! use std::sync::Arc;
 //! 
 //! fn example() -> Result<()> {
 //!     // Encrypt a file
 //!     let params = Argon2Params::default();
+//!     let event_callback = Arc::new(|event| {
+//!         match event {
+//!             SecifyEvent::EncryptProgress(progress) => println!("Encrypt progress: {:?}", progress),
+//!             SecifyEvent::DecryptProgress(progress) => println!("Decrypt progress: {:?}", progress),
+//!             SecifyEvent::Log { level, message } => {
+//!                 match level {
+//!                     LogLevel::Error => eprintln!("ERROR: {}", message),
+//!                     LogLevel::Warning => println!("WARNING: {}", message),
+//!                     LogLevel::Info => println!("INFO: {}", message),
+//!                 }
+//!             }
+//!         }
+//!     });
+//!     
 //!     encrypt_core(
 //!         "input.txt",
 //!         "output.sec", 
@@ -29,8 +43,7 @@
 //!         &EncryptionAlgorithm::XChaCha20Poly1305,
 //!         &params,
 //!         None, // No compression
-//!         Arc::new(|progress| println!("Encrypt progress: {:?}", progress)),
-//!         &|msg| println!("Log: {}", msg),
+//!         Some(event_callback.clone()),
 //!     )?;
 //!     
 //!     // Decrypt a file
@@ -38,8 +51,7 @@
 //!         "output.sec",
 //!         "restored.txt",
 //!         "password", 
-//!         Arc::new(|progress| println!("Decrypt progress: {:?}", progress)),
-//!         &|msg| println!("Log: {}", msg),
+//!         Some(event_callback),
 //!     )?;
 //!     
 //!     Ok(())
@@ -75,8 +87,7 @@ pub use streaming::{
 
 pub use progress::{
     EncryptProgress, DecryptProgress, EncryptionInfo,
-    EncryptProgressCallback, DecryptProgressCallback, LogCallback,
-    ProgressAwareReader
+    ProgressAwareReader, SecifyEvent, LogLevel, EventCallback, no_op_callback
 };
 
 pub use archive::{
@@ -91,7 +102,6 @@ pub use compression::{
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -115,8 +125,7 @@ mod tests {
             &algorithm,
             &params,
             None,
-            Arc::new(|_| {}), // Progress callback
-            &|_| {}, // Log callback
+            None, // No event callback
         ).unwrap();
         
         assert!(encrypted_file.exists());
@@ -126,8 +135,7 @@ mod tests {
             encrypted_file.to_str().unwrap(),
             decrypted_file.to_str().unwrap(),
             "test_password",
-            Arc::new(|_| {}), // Progress callback
-            &|_| {}, // Log callback
+            None, // No event callback
         ).unwrap();
         
         assert!(decrypted_file.exists());

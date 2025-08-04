@@ -14,7 +14,7 @@ use crate::crypto::*;
 use crate::error::{SecifyError, Result};
 use crate::archive::{SecArchiveWriter, SecArchiveReader, process_directory_sec};
 use crate::compression::{CompressionBufferingWriter, create_decompression_reader};
-use crate::progress::{EncryptProgress, DecryptProgress, EncryptionInfo, ProgressAwareReader};
+use crate::progress::{EncryptProgress, DecryptProgress, EncryptionInfo, ProgressAwareReader, SecifyEvent, LogLevel, EventCallback, no_op_callback};
 use crate::streaming::create_streaming_chunk_nonce;
 
 /// Size of the read buffer for streaming operations
@@ -343,20 +343,18 @@ impl<R: Read> Read for StreamingDecryptionReader<R> {
 }
 
 /// Core encryption function without UI dependencies
-pub fn encrypt_core<P, L>(
+pub fn encrypt_core(
     input_path: &str,
     output_path: &str,
     password: &str,
     algorithm: &EncryptionAlgorithm,
     argon2_params: &Argon2Params,
     compression: Option<CompressionConfig>,
-    progress_callback: Arc<P>,
-    log_callback: &L,
+    event_callback: Option<EventCallback>,
 ) -> Result<()>
-where
-    P: Fn(EncryptProgress) + 'static,
-    L: Fn(&str),
 {
+    let event_callback = event_callback.unwrap_or_else(no_op_callback);
+    
     let input_path_obj = Path::new(input_path);
     if !input_path_obj.exists() {
         return Err(SecifyError::file_error(format!("Input path does not exist: {}", input_path)));
@@ -364,16 +362,23 @@ where
     let is_directory = input_path_obj.is_dir();
 
     // Report operation type
-    progress_callback(EncryptProgress::Starting { 
+    event_callback(SecifyEvent::EncryptProgress(EncryptProgress::Starting { 
         is_directory, 
         has_compression: compression.is_some() 
-    });
+    }));
 
     // Generate cryptographic parameters
     let mut salt = [0u8; SALT_LENGTH];
     generate_secure_random_bytes(&mut salt)?;
     let base_nonce = generate_base_nonce(algorithm)?;
-    let key = derive_key_with_callback(password, &salt, argon2_params, log_callback)?;
+    
+    event_callback(SecifyEvent::Log { 
+        level: LogLevel::Info, 
+        message: format!("Deriving encryption key with Argon2id ({}MB, {} iterations, {} threads)...", 
+                         argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism)
+    });
+    
+    let key = derive_key(password, &salt, argon2_params)?;
 
     // Create main header (encryption parameters only)
     let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32);
@@ -406,7 +411,7 @@ where
     encryption_writer.write_all(&(payload_header_data.len() as u16).to_le_bytes())?;
     encryption_writer.write_all(&payload_header_data)?;
 
-    progress_callback(EncryptProgress::EncryptionStarted);
+    event_callback(SecifyEvent::EncryptProgress(EncryptProgress::EncryptionStarted));
 
     // Handle encryption based on whether we need archive format or not
     let has_archive = archive_format.is_some();
@@ -417,7 +422,10 @@ where
             let mut archive_builder = SecArchiveWriter::new(compression_writer);
             
             // Process directory
-            process_directory_sec(input_path_obj, &mut archive_builder, |progress| progress_callback(progress))?;
+            let progress_cb = Arc::clone(&event_callback);
+            process_directory_sec(input_path_obj, &mut archive_builder, |progress| {
+                progress_cb(SecifyEvent::EncryptProgress(progress));
+            })?;
             
             // Finalize the pipeline: SecArchive → Compression → Encryption → Output
             let compression_writer = archive_builder.finish();
@@ -428,7 +436,10 @@ where
             let mut archive_builder = SecArchiveWriter::new(encryption_writer);
             
             // Process directory
-            process_directory_sec(input_path_obj, &mut archive_builder, |progress| progress_callback(progress))?;
+            let progress_cb = Arc::clone(&event_callback);
+            process_directory_sec(input_path_obj, &mut archive_builder, |progress| {
+                progress_cb(SecifyEvent::EncryptProgress(progress));
+            })?;
             
             // Finalize the pipeline: SecArchive → Encryption → Output
             let encryption_writer = archive_builder.finish();
@@ -444,13 +455,13 @@ where
             let mut file = File::open(input_path_obj)
                 .map_err(|e| SecifyError::file_error(format!("Failed to open file {:?}: {}", input_path_obj, e)))?;
             
-            progress_callback(EncryptProgress::ProcessingFile { 
+            event_callback(SecifyEvent::EncryptProgress(EncryptProgress::ProcessingFile { 
                 current: 1, 
                 total: 1, 
                 name: input_path_obj.file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("unknown").to_string()
-            });
+            }));
             
             std::io::copy(&mut file, &mut compression_writer)?;
             
@@ -463,13 +474,13 @@ where
             let mut file = File::open(input_path_obj)
                 .map_err(|e| SecifyError::file_error(format!("Failed to open file {:?}: {}", input_path_obj, e)))?;
             
-            progress_callback(EncryptProgress::ProcessingFile { 
+            event_callback(SecifyEvent::EncryptProgress(EncryptProgress::ProcessingFile { 
                 current: 1, 
                 total: 1, 
                 name: input_path_obj.file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("unknown").to_string()
-            });
+            }));
             
             std::io::copy(&mut file, &mut encryption_writer)?;
             
@@ -479,28 +490,31 @@ where
         }
     }
 
-    progress_callback(EncryptProgress::EncryptionComplete);
+    event_callback(SecifyEvent::EncryptProgress(EncryptProgress::EncryptionComplete));
     
     if is_directory {
-        log_callback(&format!("Directory encrypted successfully: {}", output_path));
+        event_callback(SecifyEvent::Log { 
+            level: LogLevel::Info, 
+            message: format!("Directory encrypted successfully: {}", output_path) 
+        });
     } else {
-        log_callback(&format!("File encrypted successfully: {}", output_path));
+        event_callback(SecifyEvent::Log { 
+            level: LogLevel::Info, 
+            message: format!("File encrypted successfully: {}", output_path) 
+        });
     }
     Ok(())
 }
 
 /// Core decryption function without UI dependencies
-pub fn decrypt_core<P, L>(
+pub fn decrypt_core(
     input_path: &str,
     output_path: &str,
     password: &str,
-    progress_callback: Arc<P>,
-    log_callback: &L,
+    event_callback: Option<EventCallback>,
 ) -> Result<()>
-where
-    P: Fn(DecryptProgress) + 'static,
-    L: Fn(&str),
 {
+    let event_callback = event_callback.unwrap_or_else(no_op_callback);
     // Open encrypted file and buffer for streaming
     let file = File::open(input_path)
         .map_err(|e| SecifyError::file_error(format!("Failed to open encrypted file {}: {}", input_path, e)))?;
@@ -541,7 +555,7 @@ where
     )?;
     
     // Derive decryption key from password and salt from header
-    let key = derive_key_with_callback(password, &header.salt, &argon2_params, log_callback)?;
+    let key = derive_key(password, &header.salt, &argon2_params)?;
     
     // Get file size to calculate ciphertext size
     let file_metadata = std::fs::metadata(input_path)
@@ -593,17 +607,20 @@ where
     };
     
     // Report decryption start
-    progress_callback(DecryptProgress::DecryptionStarted { 
+    event_callback(SecifyEvent::DecryptProgress(DecryptProgress::DecryptionStarted { 
         encryption_info,
         total_bytes: ciphertext_size,
-    });
+    }));
     
-    // Create progress-aware reader wrapper - clone the Arc
-    let progress_reader = ProgressAwareReader::new(decryption_reader, ciphertext_size, progress_callback.clone());
+    // Create progress-aware reader wrapper
+    let progress_reader = ProgressAwareReader::new(decryption_reader, ciphertext_size, Arc::clone(&event_callback));
     
     // Create decompression reader if needed
     let mut decompressed_reader: Box<dyn Read> = if let Some(ref compression) = payload_header.compression {
-        log_callback("Setting up streaming decompression...");
+        event_callback(SecifyEvent::Log { 
+            level: LogLevel::Info, 
+            message: "Setting up streaming decompression...".to_string() 
+        });
         create_decompression_reader(progress_reader, Some(compression))?
     } else {
         Box::new(progress_reader)
@@ -618,13 +635,16 @@ where
     if let Some(ref archive_format) = payload_header.archive {
         if archive_format == "sec" {
             // Sec archive format (directory)
-            log_callback("Setting up streaming sec archive extraction...");
+            event_callback(SecifyEvent::Log { 
+                level: LogLevel::Info, 
+                message: "Setting up streaming sec archive extraction...".to_string() 
+            });
             
             // Report extraction strategy as directory
-            progress_callback(DecryptProgress::ExtractionStrategy {
+            event_callback(SecifyEvent::DecryptProgress(DecryptProgress::ExtractionStrategy {
                 is_single_file: false,
                 output_path: output_path.to_string(),
-            });
+            }));
             
             // Create output directory
             fs::create_dir_all(output_path)
@@ -657,17 +677,20 @@ where
                 }
             }
             
-            log_callback(&format!("Directory decrypted and extracted successfully: {}", output_path));
+            event_callback(SecifyEvent::Log { 
+                level: LogLevel::Info, 
+                message: format!("Directory decrypted and extracted successfully: {}", output_path) 
+            });
         } else {
             return Err(SecifyError::invalid_format(format!("Unsupported archive format: {}", archive_format)));
         }
     } else {
         // Single file format (no archive)
         // Report extraction strategy as single file
-        progress_callback(DecryptProgress::ExtractionStrategy {
+        event_callback(SecifyEvent::DecryptProgress(DecryptProgress::ExtractionStrategy {
             is_single_file: true,
             output_path: output_path.to_string(),
-        });
+        }));
         
         // Stream directly to output file
         let mut output_file = File::create(output_path)
@@ -676,11 +699,14 @@ where
         std::io::copy(&mut decompressed_reader, &mut output_file)
             .map_err(|e| SecifyError::file_error(format!("Failed to write decrypted data: {}", e)))?;
         
-        log_callback(&format!("File decrypted successfully: {}", output_path));
+        event_callback(SecifyEvent::Log { 
+            level: LogLevel::Info, 
+            message: format!("File decrypted successfully: {}", output_path) 
+        });
     }
     
     // Verify HMAC for file integrity after extraction is complete
-    progress_callback(DecryptProgress::VerifyingIntegrity);
+    event_callback(SecifyEvent::DecryptProgress(DecryptProgress::VerifyingIntegrity));
     
     // Create a new decryption reader to check if this is a single-chunk file
     // We'll use this to determine if HMAC verification is needed
@@ -717,7 +743,10 @@ where
     // Check if this was a single chunk file
     if hmac_verification_reader.chunk_counter <= 1 {
         // Single chunk file - no HMAC verification needed
-        log_callback("Single chunk file detected - HMAC verification skipped (AEAD provides sufficient integrity)");
+        event_callback(SecifyEvent::Log { 
+            level: LogLevel::Info, 
+            message: "Single chunk file detected - HMAC verification skipped (AEAD provides sufficient integrity)".to_string() 
+        });
     } else {
         // Multi-chunk file - verify HMAC
         // Read HMAC from the end of the original file
@@ -737,11 +766,17 @@ where
             return Err(SecifyError::authentication("File integrity verification failed - file may be corrupted or tampered with"));
         }
         
-        log_callback("Multi-chunk file HMAC verified successfully");
+        event_callback(SecifyEvent::Log { 
+            level: LogLevel::Info, 
+            message: "Multi-chunk file HMAC verified successfully".to_string() 
+        });
     }
     
-    log_callback("File integrity verified successfully");
-    progress_callback(DecryptProgress::DecryptionComplete);
+    event_callback(SecifyEvent::Log { 
+        level: LogLevel::Info, 
+        message: "File integrity verified successfully".to_string() 
+    });
+    event_callback(SecifyEvent::DecryptProgress(DecryptProgress::DecryptionComplete));
     Ok(())
 }
 
@@ -780,8 +815,7 @@ mod tests {
             &algorithm,
             &params,
             None,
-            Arc::new(|_| {}), // No progress tracking in test
-            &|_| {}, // No logging in test
+            None, // No event callback in test
         ).unwrap();
         
         // Decrypt the file
@@ -789,8 +823,7 @@ mod tests {
             encrypted_file.to_str().unwrap(),
             decrypted_file.to_str().unwrap(),
             TEST_PASSWORD,
-            Arc::new(|_| {}), // No progress tracking in test
-            &|_| {}, // No logging in test
+            None, // No event callback in test
         ).unwrap();
         
         // Verify decrypted file matches original

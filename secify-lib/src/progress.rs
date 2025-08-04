@@ -6,6 +6,33 @@
 use std::sync::Arc;
 use std::io::Read;
 
+/// Log level for event messages
+#[derive(Debug, Clone)]
+pub enum LogLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Unified event system for all operations
+#[derive(Debug, Clone)]
+pub enum SecifyEvent {
+    /// Progress events for encryption
+    EncryptProgress(EncryptProgress),
+    /// Progress events for decryption
+    DecryptProgress(DecryptProgress),
+    /// Log events with severity
+    Log { level: LogLevel, message: String },
+}
+
+/// Single callback type for all events - optional
+pub type EventCallback = Arc<dyn Fn(SecifyEvent) + Send + Sync>;
+
+/// Helper function to create a no-op event callback
+pub fn no_op_callback() -> EventCallback {
+    Arc::new(|_| {})
+}
+
 /// Progress information during encryption
 #[derive(Debug, Clone)]
 pub enum EncryptProgress {
@@ -51,30 +78,21 @@ pub struct EncryptionInfo {
     pub chunk_size: u32,
 }
 
-/// Progress callback for encryption operations
-pub type EncryptProgressCallback<'a> = &'a dyn Fn(EncryptProgress);
-
-/// Progress callback for decryption operations  
-pub type DecryptProgressCallback<'a> = &'a dyn Fn(DecryptProgress);
-
-/// Logging callback for informational messages
-pub type LogCallback<'a> = &'a dyn Fn(&str);
-
 /// Progress-aware reader wrapper that reports bytes read during decryption
 pub struct ProgressAwareReader<R: Read> {
     inner: R,
     bytes_read: u64,
     total_bytes: u64,
-    progress_callback: Arc<dyn Fn(DecryptProgress)>,
+    event_callback: EventCallback,
 }
 
 impl<R: Read> ProgressAwareReader<R> {
-    pub fn new(inner: R, total_bytes: u64, progress_callback: Arc<dyn Fn(DecryptProgress)>) -> Self {
+    pub fn new(inner: R, total_bytes: u64, event_callback: EventCallback) -> Self {
         Self {
             inner,
             bytes_read: 0,
             total_bytes,
-            progress_callback,
+            event_callback,
         }
     }
 }
@@ -83,10 +101,10 @@ impl<R: Read> Read for ProgressAwareReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let bytes_read = self.inner.read(buf)?;
         self.bytes_read += bytes_read as u64;
-        (self.progress_callback)(DecryptProgress::BytesProcessed {
+        (self.event_callback)(SecifyEvent::DecryptProgress(DecryptProgress::BytesProcessed {
             current: self.bytes_read,
             total: self.total_bytes,
-        });
+        }));
         Ok(bytes_read)
     }
 }
