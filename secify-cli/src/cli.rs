@@ -13,6 +13,15 @@ fn parse_compression_algorithm(s: &str) -> Result<CompressionAlgorithm, String> 
     }
 }
 
+fn parse_compression_level(s: &str) -> Result<i32, String> {
+    let level: i32 = s.parse().map_err(|_| "Invalid compression level")?;
+    if level >= 1 && level <= 22 {
+        Ok(level)
+    } else {
+        Err("Compression level must be between 1 and 22".to_string())
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "secify")]
 #[command(about = "A CLI tool for encrypting and decrypting files and directories using industry-standard cryptography")]
@@ -30,7 +39,7 @@ pub struct Cli {
     #[arg(short, long, value_parser = parse_compression_algorithm, default_value = "zstd")]
     pub compression: CompressionAlgorithm,
     /// Compression level (1-22 for zstd, default: 3). Higher values are slower but compress better.
-    #[arg(long, default_value = "3", help = "Compression level (1-22 for zstd, default: 3)")]
+    #[arg(long, value_parser = parse_compression_level, default_value = "3", help = "Compression level (1-22 for zstd, default: 3). Higher values compress better but slower")]
     pub compression_level: i32,
     /// Argon2 memory cost in MB (8-2048, default: 128). Higher values are more secure but slower.
     #[arg(long, default_value = "128", help = "Argon2 memory cost in MB (8-2048, default: 128)")]

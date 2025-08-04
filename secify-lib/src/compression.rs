@@ -5,7 +5,7 @@
 
 use std::io::{Read, Write};
 use zstd;
-use crate::crypto::{CompressionConfig, CompressionAlgorithm, DEFAULT_CHUNK_SIZE};
+use crate::crypto::{RuntimeCompressionConfig, CompressionAlgorithm, CompressionConfig};
 use crate::core::StreamingEncryptionWriter;
 use crate::error::{SecifyError, Result};
 
@@ -32,30 +32,48 @@ pub struct CompressionBufferingWriter<W: Write> {
     chunk_size: usize,
 }
 
+/// Calculate optimal buffer size and window log based on compression level
+/// This determines how much uncompressed data to buffer before compressing,
+/// independent of encryption chunk sizes.
+fn get_compression_params(level: i32) -> (usize, u32) {
+    match level {
+        1..=3 => (32 * 1024, 16),   // Fast: 32KB buffer, 64KB window
+        4..=6 => (64 * 1024, 17),   // Balanced: 64KB buffer, 128KB window  
+        7..=12 => (128 * 1024, 18), // Good: 128KB buffer, 256KB window
+        13..=19 => (256 * 1024, 20), // High: 256KB buffer, 1MB window
+        _ => (512 * 1024, 22),      // Maximum: 512KB buffer, 4MB window
+    }
+}
+
 impl<W: Write> CompressionBufferingWriter<W> {
     pub fn new(
         inner: StreamingEncryptionWriter<W>,
-        compression: Option<&CompressionConfig>,
+        compression: Option<&RuntimeCompressionConfig>,
     ) -> Result<Self> {
-        let chunk_size = DEFAULT_CHUNK_SIZE - 16; // Account for auth tag
-        
-        let compression_encoder = if let Some(config) = compression {
+        let (compression_buffer_size, compression_encoder) = if let Some(config) = compression {
             match CompressionAlgorithm::from_string(&config.algorithm)? {
-                CompressionAlgorithm::None => None,
+                CompressionAlgorithm::None => (0, None), // Small buffer for passthrough
                 CompressionAlgorithm::Zstd => {
-                    let encoder = zstd::Encoder::new(Vec::new(), 3)?; // Use default level 3
-                    Some(encoder)
+                    let level = config.level;
+                    let (buffer_size, window_log) = get_compression_params(level);
+                    
+                    // Create encoder with level-appropriate settings
+                    let mut encoder = zstd::Encoder::new(Vec::with_capacity(buffer_size), level)?;
+                    encoder.window_log(window_log)?;
+                    encoder.long_distance_matching(level >= 7)?; // Enable for higher levels
+                    
+                    (buffer_size, Some(encoder))
                 }
             }
         } else {
-            None
+            (0, None) // Small buffer for no compression
         };
         
         Ok(Self {
             inner,
-            compression_buffer: Vec::new(),
+            compression_buffer: Vec::with_capacity(compression_buffer_size),
             compression_encoder,
-            chunk_size,
+            chunk_size: compression_buffer_size, // Buffer size for compression input buffering
         })
     }
     
@@ -64,8 +82,12 @@ impl<W: Write> CompressionBufferingWriter<W> {
         if let Some(ref mut encoder) = self.compression_encoder {
             let compressed_output = encoder.get_ref();
             if !compressed_output.is_empty() {
+                // Reserve capacity to avoid reallocations
+                self.compression_buffer.reserve(compressed_output.len());
                 self.compression_buffer.extend_from_slice(compressed_output);
-                *encoder.get_mut() = Vec::new();
+                
+                // Clear encoder buffer efficiently
+                encoder.get_mut().clear();
                 self.flush_compressed_chunks()?;
             }
         }
@@ -73,10 +95,11 @@ impl<W: Write> CompressionBufferingWriter<W> {
     }
     
     fn flush_compressed_chunks(&mut self) -> Result<()> {
-        // Extract full chunks from compression buffer and send to encryption
+        // Process chunks without unnecessary allocation - write directly from buffer
         while self.compression_buffer.len() >= self.chunk_size {
-            let chunk = self.compression_buffer.drain(..self.chunk_size).collect::<Vec<u8>>();
-            self.inner.write_all(&chunk)?;
+            let chunk = &self.compression_buffer[..self.chunk_size];
+            self.inner.write_all(chunk)?;
+            self.compression_buffer.drain(..self.chunk_size);
         }
         Ok(())
     }
@@ -194,8 +217,9 @@ mod tests {
         ).unwrap();
         
         // Create compression config
-        let compression_config = CompressionConfig {
+        let compression_config = RuntimeCompressionConfig {
             algorithm: "zstd".to_string(),
+            level: 3,
         };
         
         // Create compression writer

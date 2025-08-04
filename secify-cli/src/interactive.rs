@@ -3,7 +3,7 @@ use std::path::Path;
 use std::io::{self, Write};
 use anyhow::{Result, Context, bail};
 
-use secify_lib::{EncryptionAlgorithm, Argon2Params, CompressionAlgorithm, CompressionConfig};
+use secify_lib::{EncryptionAlgorithm, Argon2Params, CompressionAlgorithm, RuntimeCompressionConfig};
 use crate::cli::{DEFAULT_ALGORITHM, MIN_PASSWORD_LENGTH};
 use crate::progress::{encrypt_with_ui, decrypt_with_ui};
 
@@ -211,8 +211,28 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
         };
         
         if matches!(compression_alg, CompressionAlgorithm::Zstd) {
-            Some(CompressionConfig {
+            println!("\nZstandard Compression Level:");
+            println!("1-3: Fast compression (lower CPU usage)");
+            println!("4-6: Balanced compression (default: 3)");
+            println!("7-12: Good compression (higher CPU usage)");
+            println!("13-19: High compression (much slower)");
+            println!("20-22: Maximum compression (very slow)");
+            
+            let compression_level = loop {
+                let input = prompt_user("Enter compression level (1-22, default: 3): ")?;
+                if input.is_empty() {
+                    break 3; // Default level
+                }
+                match input.parse::<i32>() {
+                    Ok(level) if level >= 1 && level <= 22 => break level,
+                    Ok(_) => println!("Compression level must be between 1 and 22."),
+                    Err(_) => println!("Invalid number. Please enter a value between 1 and 22."),
+                }
+            };
+            
+            Some(RuntimeCompressionConfig {
                 algorithm: compression_alg.to_string().to_owned(),
+                level: compression_level,
             })
         } else {
             None

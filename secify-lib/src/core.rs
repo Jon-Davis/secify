@@ -17,14 +17,37 @@ use crate::compression::{CompressionBufferingWriter, create_decompression_reader
 use crate::progress::{EncryptProgress, DecryptProgress, EncryptionInfo, ProgressAwareReader, SecifyEvent, LogLevel, EventCallback, no_op_callback};
 use crate::streaming::create_streaming_chunk_nonce;
 
-/// Size of the read buffer for streaming operations
-const STREAM_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+/// Size of the read buffer for streaming operations - optimized for modern SSDs
+const STREAM_BUFFER_SIZE: usize = 512 * 1024; // 512KB for better I/O throughput
+
+/// Large file buffer size for files > 100MB
+const LARGE_FILE_BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2MB for large files
+
+/// Very large file buffer size for files > 1GB
+const VERY_LARGE_FILE_BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4MB for very large files
+
+/// Threshold for using larger buffers
+const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024; // 100MB
+
+/// Threshold for using very large buffers
+const VERY_LARGE_FILE_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
 
 /// Maximum allowed protobuf header size (1MB)
 const MAX_HEADER_SIZE: usize = 65_536;
 
 /// HMAC size in bytes (SHA256)
 const HMAC_SIZE: usize = 32;
+
+/// Choose optimal buffer size based on file size
+fn get_optimal_buffer_size(file_size: u64) -> usize {
+    if file_size >= VERY_LARGE_FILE_THRESHOLD {
+        VERY_LARGE_FILE_BUFFER_SIZE
+    } else if file_size >= LARGE_FILE_THRESHOLD {
+        LARGE_FILE_BUFFER_SIZE
+    } else {
+        STREAM_BUFFER_SIZE
+    }
+}
 
 /// Core streaming encryption writer without UI dependencies
 pub struct StreamingEncryptionWriter<W: Write> {
@@ -278,8 +301,14 @@ impl<R: Read> StreamingDecryptionReader<R> {
         
         // Read any remaining HMAC bytes if we haven't finished reading the file
         if !self.finished && self.total_read < self.file_size {
-            // Read and discard remaining ciphertext
-            let mut temp_buffer = vec![0u8; 4096];
+            // Read and discard remaining ciphertext - use larger buffer for efficiency
+            let remaining_bytes = self.file_size - self.total_read;
+            let buffer_size = if remaining_bytes > 64 * 1024 {
+                64 * 1024  // 64KB max for discard buffer
+            } else {
+                remaining_bytes as usize
+            };
+            let mut temp_buffer = vec![0u8; buffer_size];
             while self.total_read < self.file_size {
                 match self.inner.read(&mut temp_buffer) {
                     Ok(0) => break,
@@ -349,7 +378,7 @@ pub fn encrypt_core(
     password: &str,
     algorithm: &EncryptionAlgorithm,
     argon2_params: &Argon2Params,
-    compression: Option<CompressionConfig>,
+    compression: Option<RuntimeCompressionConfig>,
     event_callback: Option<EventCallback>,
 ) -> Result<()>
 {
@@ -360,6 +389,16 @@ pub fn encrypt_core(
         return Err(SecifyError::file_error(format!("Input path does not exist: {}", input_path)));
     }
     let is_directory = input_path_obj.is_dir();
+
+    // Determine optimal buffer size based on input size
+    let buffer_size = if !is_directory {
+        match input_path_obj.metadata() {
+            Ok(metadata) => get_optimal_buffer_size(metadata.len()),
+            Err(_) => STREAM_BUFFER_SIZE, // Fallback to default
+        }
+    } else {
+        STREAM_BUFFER_SIZE // Use default for directories
+    };
 
     // Report operation type
     event_callback(SecifyEvent::EncryptProgress(EncryptProgress::Starting { 
@@ -385,14 +424,17 @@ pub fn encrypt_core(
     let protobuf_header = serialize_header_to_protobuf(&header)?;
 
     // Create payload header (compression and archive info)
-        let archive_format = if is_directory { Some("sec".to_string()) } else { None };
-    let payload_header = create_payload_header(compression.clone(), archive_format.clone());
+    let archive_format = if is_directory { Some("sec".to_string()) } else { None };
+    let compression_for_header = compression.as_ref().map(|config| CompressionConfig {
+        algorithm: config.algorithm.clone(),
+    });
+    let payload_header = create_payload_header(compression_for_header, archive_format.clone());
     let payload_header_data = serialize_payload_header_to_protobuf(&payload_header)?;
 
-    // Create output file
+    // Create output file with optimized buffer size
     let output_file = File::create(output_path)
         .map_err(|e| SecifyError::file_error(format!("Failed to create output file {}: {}", output_path, e)))?;
-    let mut buffered_output = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
+    let mut buffered_output = BufWriter::with_capacity(buffer_size, output_file);
 
     // Write main header length and header
     buffered_output.write_all(&(protobuf_header.len() as u16).to_le_bytes())?;
@@ -451,9 +493,10 @@ pub fn encrypt_core(
         if compression.is_some() {
             let mut compression_writer = CompressionBufferingWriter::new(encryption_writer, compression.as_ref())?;
             
-            // Stream file content directly to compression then encryption
-            let mut file = File::open(input_path_obj)
+            // Stream file content directly to compression then encryption with optimized buffer
+            let file = File::open(input_path_obj)
                 .map_err(|e| SecifyError::file_error(format!("Failed to open file {:?}: {}", input_path_obj, e)))?;
+            let mut buffered_file = BufReader::with_capacity(buffer_size, file);
             
             event_callback(SecifyEvent::EncryptProgress(EncryptProgress::ProcessingFile { 
                 current: 1, 
@@ -463,16 +506,17 @@ pub fn encrypt_core(
                     .unwrap_or("unknown").to_string()
             }));
             
-            std::io::copy(&mut file, &mut compression_writer)?;
+            std::io::copy(&mut buffered_file, &mut compression_writer)?;
             
             // Finalize the pipeline: Compression → Encryption → Output
             let encryption_writer = compression_writer.finalize()?;
             let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
             final_output.flush().map_err(|e| SecifyError::Io(e))?;
         } else {
-            // Direct file streaming to encryption
-            let mut file = File::open(input_path_obj)
+            // Direct file streaming to encryption with optimized buffer
+            let file = File::open(input_path_obj)
                 .map_err(|e| SecifyError::file_error(format!("Failed to open file {:?}: {}", input_path_obj, e)))?;
+            let mut buffered_file = BufReader::with_capacity(buffer_size, file);
             
             event_callback(SecifyEvent::EncryptProgress(EncryptProgress::ProcessingFile { 
                 current: 1, 
@@ -482,7 +526,7 @@ pub fn encrypt_core(
                     .unwrap_or("unknown").to_string()
             }));
             
-            std::io::copy(&mut file, &mut encryption_writer)?;
+            std::io::copy(&mut buffered_file, &mut encryption_writer)?;
             
             // Finalize encryption
             let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
@@ -515,10 +559,17 @@ pub fn decrypt_core(
 ) -> Result<()>
 {
     let event_callback = event_callback.unwrap_or_else(no_op_callback);
-    // Open encrypted file and buffer for streaming
+    
+    // Determine optimal buffer size based on file size
+    let file_metadata = std::fs::metadata(input_path)
+        .map_err(|e| SecifyError::file_error(format!("Failed to get file metadata {}: {}", input_path, e)))?;
+    let file_size = file_metadata.len();
+    let buffer_size = get_optimal_buffer_size(file_size);
+    
+    // Open encrypted file and buffer for streaming with optimized buffer size
     let file = File::open(input_path)
         .map_err(|e| SecifyError::file_error(format!("Failed to open encrypted file {}: {}", input_path, e)))?;
-    let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
+    let mut reader = BufReader::with_capacity(buffer_size, file);
 
     // Read protobuf header length (first 2 bytes)
     let mut header_length_bytes = [0u8; 2];
@@ -712,7 +763,7 @@ pub fn decrypt_core(
     // We'll use this to determine if HMAC verification is needed
     let verification_file = File::open(input_path)
         .map_err(|e| SecifyError::file_error(format!("Failed to open file for HMAC verification {}: {}", input_path, e)))?;
-    let mut verification_reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, verification_file);
+    let mut verification_reader = BufReader::with_capacity(get_optimal_buffer_size(file_size), verification_file);
     
     // Skip header
     verification_reader.read_exact(&mut [0u8; 2])?; // header length
@@ -730,8 +781,8 @@ pub fn decrypt_core(
         ciphertext_size,
     )?;
     
-    // Read all plaintext to build HMAC and count chunks
-    let mut temp_buffer = vec![0u8; 64 * 1024]; // 64KB buffer
+    // Read all plaintext to build HMAC and count chunks - use optimal buffer size
+    let mut temp_buffer = vec![0u8; get_optimal_buffer_size(ciphertext_size)];
     loop {
         match hmac_verification_reader.read(&mut temp_buffer) {
             Ok(0) => break, // EOF

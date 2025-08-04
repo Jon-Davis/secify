@@ -6,7 +6,7 @@ use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use secify_lib::{
     encrypt_core, decrypt_core, 
-    EncryptProgress, DecryptProgress, EncryptionAlgorithm, Argon2Params, CompressionConfig,
+    EncryptProgress, DecryptProgress, EncryptionAlgorithm, Argon2Params, RuntimeCompressionConfig,
     Result as SecifyResult, SecifyEvent, LogLevel
 };
 use indicatif::{ProgressBar, ProgressStyle};
@@ -44,7 +44,7 @@ pub fn encrypt_with_ui(
     password: &str,
     algorithm: &EncryptionAlgorithm,
     argon2_params: &Argon2Params,
-    compression: Option<CompressionConfig>,
+    compression: Option<RuntimeCompressionConfig>,
 ) -> SecifyResult<()> {
     let progress_bar = Arc::new(Mutex::new(None::<ProgressBar>));
     let start_time = Instant::now();

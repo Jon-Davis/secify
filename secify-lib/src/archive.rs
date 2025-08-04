@@ -82,7 +82,8 @@ impl<R: Read> SecArchiveReader<R> {
     
     pub fn read_file_data(&mut self, size: u64, mut writer: impl Write) -> std::io::Result<()> {
         let mut remaining = size;
-        let mut buffer = vec![0u8; 64 * 1024]; // 64KB buffer
+        // Use larger buffer for better performance - 256KB
+        let mut buffer = vec![0u8; 256 * 1024];
         
         while remaining > 0 {
             let to_read = std::cmp::min(buffer.len() as u64, remaining) as usize;

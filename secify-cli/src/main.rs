@@ -2,7 +2,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use clap::Parser;
 
-use secify_lib::{Argon2Params, CompressionConfig, CompressionAlgorithm};
+use secify_lib::{Argon2Params, RuntimeCompressionConfig, CompressionAlgorithm};
 
 mod cli;
 mod progress;
@@ -21,8 +21,9 @@ fn main() -> Result<()> {
     let compression_config = if matches!(cli.compression, CompressionAlgorithm::None) {
         None
     } else {
-        Some(CompressionConfig {
+        Some(RuntimeCompressionConfig {
             algorithm: cli.compression.to_string().to_owned(),
+            level: cli.compression_level,
         })
     };
     
