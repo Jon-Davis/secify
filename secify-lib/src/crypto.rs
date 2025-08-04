@@ -703,10 +703,10 @@ mod tests {
         assert_eq!(header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
         assert_eq!(header.archive, None); // Single file has no archive field
         
-        // Test directory header with TAR archive format
-        let archive_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, Some("tar".to_string()));
+        // Test directory header with minimal archive format
+        let archive_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, Some("minimal".to_string()));
         assert_eq!(archive_header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
-        assert_eq!(archive_header.archive, Some("tar".to_string())); // Directory has tar archive field
+        assert_eq!(archive_header.archive, Some("minimal".to_string())); // Directory has minimal archive field
     }
 
     #[test]
@@ -1199,8 +1199,8 @@ mod tests {
         assert_eq!(single_file_header.archive, None);
         
         // Directory header (with archive field)
-        let directory_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, Some("tar".to_string()));
-        assert_eq!(directory_header.archive, Some("tar".to_string()));
+        let directory_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, Some("minimal".to_string()));
+        assert_eq!(directory_header.archive, Some("minimal".to_string()));
         
         // Verify basic header fields are correct for both
         assert_eq!(single_file_header.version, FILE_FORMAT_VERSION);

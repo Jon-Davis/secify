@@ -8,7 +8,6 @@ use std::path::Path;
 use std::io::{Read, Write, BufReader, BufWriter, Seek};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tar::Builder;
 use zstd;
 
 use crate::crypto::*;
@@ -22,6 +21,93 @@ const MAX_HEADER_SIZE: usize = 1_048_576;
 
 /// HMAC size in bytes (SHA256)
 const HMAC_SIZE: usize = 32;
+
+/// Custom archive format for minimal overhead
+/// Format: [name_len: u32][name: utf8][size: u64][data]
+struct MinimalArchiveWriter<W: Write> {
+    writer: W,
+}
+
+impl<W: Write> MinimalArchiveWriter<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+    
+    fn add_file(&mut self, path: &str, size: u64, mut reader: impl Read) -> std::io::Result<()> {
+        // Write name length and name
+        let name_bytes = path.as_bytes();
+        self.writer.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+        self.writer.write_all(name_bytes)?;
+        
+        // Write file size
+        self.writer.write_all(&size.to_le_bytes())?;
+        
+        // Copy file data
+        std::io::copy(&mut reader, &mut self.writer)?;
+        
+        Ok(())
+    }
+    
+    fn finish(self) -> W {
+        self.writer
+    }
+}
+
+struct MinimalArchiveReader<R: Read> {
+    reader: R,
+}
+
+impl<R: Read> MinimalArchiveReader<R> {
+    fn new(reader: R) -> Self {
+        Self { reader }
+    }
+    
+    fn next_entry(&mut self) -> std::io::Result<Option<(String, u64)>> {
+        // Try to read name length
+        let mut name_len_bytes = [0u8; 4];
+        match self.reader.read_exact(&mut name_len_bytes) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        
+        let name_len = u32::from_le_bytes(name_len_bytes) as usize;
+        if name_len > 4096 { // Sanity check
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Name too long"));
+        }
+        
+        // Read name
+        let mut name_bytes = vec![0u8; name_len];
+        self.reader.read_exact(&mut name_bytes)?;
+        let name = String::from_utf8(name_bytes)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in filename"))?;
+        
+        // Read file size
+        let mut size_bytes = [0u8; 8];
+        self.reader.read_exact(&mut size_bytes)?;
+        let size = u64::from_le_bytes(size_bytes);
+        
+        Ok(Some((name, size)))
+    }
+    
+    fn read_file_data(&mut self, size: u64, mut writer: impl Write) -> std::io::Result<()> {
+        let mut remaining = size;
+        let mut buffer = vec![0u8; 64 * 1024]; // 64KB buffer
+        
+        while remaining > 0 {
+            let to_read = std::cmp::min(buffer.len() as u64, remaining) as usize;
+            let bytes_read = self.reader.read(&mut buffer[..to_read])?;
+            if bytes_read == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Unexpected end of archive"));
+            }
+            
+            writer.write_all(&buffer[..bytes_read])?;
+            remaining -= bytes_read as u64;
+        }
+        
+        Ok(())
+    }
+}
 
 /// Progress callback for encryption operations
 pub type EncryptProgressCallback<'a> = &'a dyn Fn(EncryptProgress);
@@ -532,8 +618,8 @@ where
     let base_nonce = generate_base_nonce(algorithm)?;
     let key = derive_key_with_callback(password, &salt, argon2_params, log_callback)?;
 
-    // Create header - only use TAR format for directories
-    let archive_format = if is_directory { Some("tar".to_string()) } else { None };
+    // Create header - only use minimal archive format for directories
+    let archive_format = if is_directory { Some("minimal".to_string()) } else { None };
     let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32, compression.clone(), archive_format);
     let protobuf_header = serialize_header_to_protobuf(&header)?;
 
@@ -557,34 +643,34 @@ where
 
     progress_callback(EncryptProgress::EncryptionStarted);
 
-    // Handle encryption based on whether we need TAR format or not
+    // Handle encryption based on whether we need archive format or not
     if header.archive.is_some() {
-        // Directory: Use TAR format with compression pipeline
+        // Directory: Use minimal archive format with compression pipeline
         if compression.is_some() {
             let compression_writer = CompressionBufferingWriter::new(encryption_writer, compression.as_ref())?;
-            let mut tar_builder = Builder::new(compression_writer);
+            let mut archive_builder = MinimalArchiveWriter::new(compression_writer);
             
             // Process directory
-            process_directory_core(input_path_obj, &mut tar_builder, &progress_callback)?;
+            process_directory_minimal(input_path_obj, &mut archive_builder, &progress_callback)?;
             
-            // Finalize the pipeline: TAR → Compression → Encryption → Output
-            let compression_writer = tar_builder.into_inner().map_err(|e| SecifyError::archive(format!("Failed to finish TAR archive: {}", e)))?;
+            // Finalize the pipeline: MinimalArchive → Compression → Encryption → Output
+            let compression_writer = archive_builder.finish();
             let encryption_writer = compression_writer.finalize()?;
             let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
             final_output.flush().map_err(|e| SecifyError::Io(e))?;
         } else {
-            let mut tar_builder = Builder::new(encryption_writer);
+            let mut archive_builder = MinimalArchiveWriter::new(encryption_writer);
             
             // Process directory
-            process_directory_core(input_path_obj, &mut tar_builder, &progress_callback)?;
+            process_directory_minimal(input_path_obj, &mut archive_builder, &progress_callback)?;
             
-            // Finalize the pipeline: TAR → Encryption → Output
-            let encryption_writer = tar_builder.into_inner().map_err(|e| SecifyError::archive(format!("Failed to finish TAR archive: {}", e)))?;
+            // Finalize the pipeline: MinimalArchive → Encryption → Output
+            let encryption_writer = archive_builder.finish();
             let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
             final_output.flush().map_err(|e| SecifyError::Io(e))?;
         }
     } else {
-        // Single file: Direct streaming without TAR overhead
+        // Single file: Direct streaming without archive overhead
         if compression.is_some() {
             let mut compression_writer = CompressionBufferingWriter::new(encryption_writer, compression.as_ref())?;
             
@@ -754,10 +840,9 @@ where
 
     // Handle extraction based on archive format
     if let Some(ref archive_format) = header.archive {
-        if archive_format == "tar" {
-            // TAR archive format (directory)
-            log_callback("Setting up streaming TAR extraction...");
-            let mut tar_archive = tar::Archive::new(decompressed_reader);
+        if archive_format == "minimal" {
+            // Minimal archive format (directory)
+            log_callback("Setting up streaming minimal archive extraction...");
             
             // Report extraction strategy as directory
             progress_callback(DecryptProgress::ExtractionStrategy {
@@ -765,19 +850,43 @@ where
                 output_path: output_path.to_string(),
             });
             
-            // Extract entire TAR archive to directory
+            // Create output directory
             fs::create_dir_all(output_path)
                 .map_err(|e| SecifyError::file_error(format!("Failed to create output directory {}: {}", output_path, e)))?;
             
-            tar_archive.unpack(output_path)
-                .map_err(|e| SecifyError::archive(format!("Failed to extract TAR archive: {}", e)))?;
+            // Extract minimal archive
+            let mut archive_reader = MinimalArchiveReader::new(decompressed_reader);
+            while let Some((name, size)) = archive_reader.next_entry()
+                .map_err(|e| SecifyError::archive(format!("Failed to read archive entry: {}", e)))? {
+                
+                let output_file_path = Path::new(output_path).join(&name);
+                
+                if name.ends_with('/') {
+                    // Directory entry
+                    fs::create_dir_all(&output_file_path)
+                        .map_err(|e| SecifyError::file_error(format!("Failed to create directory {}: {}", output_file_path.display(), e)))?;
+                } else {
+                    // File entry
+                    // Ensure parent directory exists
+                    if let Some(parent) = output_file_path.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|e| SecifyError::file_error(format!("Failed to create parent directory {}: {}", parent.display(), e)))?;
+                    }
+                    
+                    let mut output_file = File::create(&output_file_path)
+                        .map_err(|e| SecifyError::file_error(format!("Failed to create output file {}: {}", output_file_path.display(), e)))?;
+                    
+                    archive_reader.read_file_data(size, &mut output_file)
+                        .map_err(|e| SecifyError::archive(format!("Failed to extract file data for {}: {}", name, e)))?;
+                }
+            }
             
             log_callback(&format!("Directory decrypted and extracted successfully: {}", output_path));
         } else {
             return Err(SecifyError::invalid_format(format!("Unsupported archive format: {}", archive_format)));
         }
     } else {
-        // Single file format (no TAR)
+        // Single file format (no archive)
         // Report extraction strategy as single file
         progress_callback(DecryptProgress::ExtractionStrategy {
             is_single_file: true,
@@ -892,9 +1001,9 @@ impl<'a, R: Read> Read for ProgressAwareReader<'a, R> {
 }
 
 /// Helper functions without UI dependencies
-fn process_directory_core<W: Write, P>(
+fn process_directory_minimal<W: Write, P>(
     input_path: &Path,
-    tar_builder: &mut Builder<W>,
+    archive_builder: &mut MinimalArchiveWriter<W>,
     progress_callback: P,
 ) -> Result<()>
 where
@@ -905,10 +1014,10 @@ where
     progress_callback(EncryptProgress::FileCountComplete { total_files });
     
     let mut processed_files = 0;
-    stream_tar_directory_recursive_core(
+    stream_minimal_directory_recursive(
         input_path,
         input_path,
-        tar_builder,
+        archive_builder,
         &mut processed_files,
         &progress_callback,
     )?;
@@ -936,11 +1045,11 @@ fn count_files_in_directory_core(dir_path: &Path) -> Result<u64> {
     Ok(count)
 }
 
-/// Recursively add directory contents to streaming TAR builder
-fn stream_tar_directory_recursive_core<W: Write>(
+/// Recursively add directory contents to minimal archive builder
+fn stream_minimal_directory_recursive<W: Write>(
     base_path: &Path,
     current_path: &Path,
-    tar: &mut Builder<W>,
+    archive: &mut MinimalArchiveWriter<W>,
     processed_files: &mut u64,
     progress_callback: &dyn Fn(EncryptProgress),
 ) -> Result<()>
@@ -955,9 +1064,10 @@ fn stream_tar_directory_recursive_core<W: Write>(
             .map_err(|e| SecifyError::file_error(format!("Failed to create relative path: {}", e)))?;
         
         if path.is_dir() {
-            // Add directory to TAR
-            tar.append_dir(relative_path, &path)
-                .map_err(|e| SecifyError::archive(format!("Failed to add directory to tar {}: {}", relative_path.display(), e)))?;
+            // For directories, add a special entry with "/" suffix and zero size
+            let dir_name = format!("{}/", relative_path.display());
+            archive.add_file(&dir_name, 0, std::io::empty())
+                .map_err(|e| SecifyError::archive(format!("Failed to add directory to archive {}: {}", dir_name, e)))?;
             
             // Update progress
             *processed_files += 1;
@@ -968,14 +1078,18 @@ fn stream_tar_directory_recursive_core<W: Write>(
             });
             
             // Recursively add directory contents
-            stream_tar_directory_recursive_core(base_path, &path, tar, processed_files, &progress_callback)?;
+            stream_minimal_directory_recursive(base_path, &path, archive, processed_files, &progress_callback)?;
         } else {
-            // Add file to TAR with streaming
-            let mut file = File::open(&path)
+            // Add file to archive with streaming
+            let file = File::open(&path)
                 .map_err(|e| SecifyError::file_error(format!("Failed to open file {}: {}", path.display(), e)))?;
             
-            tar.append_file(relative_path, &mut file)
-                .map_err(|e| SecifyError::archive(format!("Failed to add file to tar {}: {}", relative_path.display(), e)))?;
+            let metadata = file.metadata()
+                .map_err(|e| SecifyError::file_error(format!("Failed to get file metadata {}: {}", path.display(), e)))?;
+            let file_size = metadata.len();
+            
+            archive.add_file(&relative_path.display().to_string(), file_size, file)
+                .map_err(|e| SecifyError::archive(format!("Failed to add file to archive {}: {}", relative_path.display(), e)))?;
             
             // Update progress
             *processed_files += 1;

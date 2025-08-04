@@ -36,7 +36,7 @@ pub enum SecifyError {
     #[error("Decompression error: {message}")]
     Decompression { message: String },
 
-    /// Archive operation failed (TAR-related)
+    /// Archive operation failed (streaming archive format)
     #[error("Archive error: {message}")]
     Archive { message: String },
 

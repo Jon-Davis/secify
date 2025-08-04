@@ -1,16 +1,16 @@
 //! Secify Core Library
 //! 
 //! A library for creating and reading encrypted .sec files with streaming encryption,
-//! compression, and TAR archiving support.
+//! compression, and minimal archive format support.
 //! 
 //! # Features
 //! 
 //! - **Multiple encryption algorithms**: AES-256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305
 //! - **Streaming encryption/decryption**: Memory-efficient processing of large files
 //! - **Compression support**: zstd compression with configurable levels
-//! - **TAR archiving**: Unified format for both files and directories
+//! - **Minimal archiving**: Efficient streaming format for both files and directories
 //! - **Strong key derivation**: Argon2id with configurable parameters
-//! - **File integrity**: HMAC-SHA256 verification
+//! - **File integrity**: HMAC-SHA256 verification for multi-chunk files
 //! - **Progress reporting**: Callback-based progress tracking
 //! 
 //! # Examples

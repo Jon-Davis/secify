@@ -10,7 +10,7 @@ message EncryptionHeader {
   bytes nonce = 5;
   uint32 chunk_size = 6;
   optional CompressionConfig compression = 7;
-  optional string archive = 8;
+  optional string archive = 8; // "minimal" for new format, "tar" for legacy
 }
 
 message KeyDerivationConfig {
