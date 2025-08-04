@@ -52,7 +52,7 @@ impl<W: Write> CompressionBufferingWriter<W> {
     ) -> Result<Self> {
         let (compression_buffer_size, compression_encoder) = if let Some(config) = compression {
             match CompressionAlgorithm::from_string(&config.algorithm)? {
-                CompressionAlgorithm::None => (0, None), // Small buffer for passthrough
+                CompressionAlgorithm::None => (0, None), // No buffer needed for passthrough
                 CompressionAlgorithm::Zstd => {
                     let level = config.level;
                     let (buffer_size, window_log) = get_compression_params(level);
@@ -66,7 +66,7 @@ impl<W: Write> CompressionBufferingWriter<W> {
                 }
             }
         } else {
-            (0, None) // Small buffer for no compression
+            (0, None) // No buffer needed when no compression is configured
         };
         
         Ok(Self {
@@ -133,21 +133,8 @@ impl<W: Write> Write for CompressionBufferingWriter<W> {
             self.handle_compression_output()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         } else {
-            // No compression - pass through directly with chunk management
-            let mut remaining = buf;
-            while !remaining.is_empty() {
-                let space_available = self.chunk_size - self.compression_buffer.len();
-                let to_copy = remaining.len().min(space_available);
-                
-                self.compression_buffer.extend_from_slice(&remaining[..to_copy]);
-                remaining = &remaining[to_copy..];
-                
-                // If buffer is full, flush it
-                if self.compression_buffer.len() >= self.chunk_size {
-                    self.flush_compressed_chunks()
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                }
-            }
+            // No compression - pass through directly to encryption layer
+            self.inner.write_all(buf)?;
         }
         
         Ok(buf.len())
