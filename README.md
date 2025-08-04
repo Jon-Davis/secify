@@ -60,9 +60,13 @@ The `.sec` format is a binary container with the following structure:
 ┌─────────────────────────────────────────────────────────────┐
 │                    .sec File Format                         │
 ├─────────────────────────────────────────────────────────────┤
-│ Header Length    │ 4 bytes (little-endian u32)              │
+│ Public Header Len│ 2 bytes (little-endian u16)              │
 ├─────────────────────────────────────────────────────────────┤
-│ Protobuf Header  │ Variable length                          │
+│ Public Header    │ Variable length (encryption info only)   │
+├─────────────────────────────────────────────────────────────┤
+│ Private Header Len│ 2 bytes (little-endian u16)             │
+├─────────────────────────────────────────────────────────────┤
+│ Private Header   │ Variable length (encrypted metadata)     │
 ├─────────────────────────────────────────────────────────────┤
 │ Encrypted Data   │ Variable length (optionally compressed)  │
 ├─────────────────────────────────────────────────────────────┤
@@ -70,22 +74,23 @@ The `.sec` format is a binary container with the following structure:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The format was inspired by JWT, following a header, payload, signature style.
+The format uses a **split header design** for enhanced security:
+- **Public Header**: Contains only encryption parameters needed to start decryption
+- **Private Header**: Contains compression and archive metadata, encrypted as part of the data stream
+
+This ensures that metadata about the file structure is protected and cannot be analyzed without the password.
 
 **Note:** Single-chunk files omit the HMAC section entirely, relying on AEAD authentication for integrity.
 
 ### Protocol Buffer Header Structure
 
-The header contains all encryption metadata in Protocol Buffer format:
+The public header contains encryption metadata in Protocol Buffer format:
 
 ```rust
+// Public Header (unencrypted)
 {
   "version": 1,                           // File format version
   "encryption_algorithm": "AES-256-GCM",  // Encryption method
-  "compression": {                        // Optional compression configuration
-    "algorithm": "zstd",                  // Compression algorithm (if used)
-    "level": 3                            // Compression level (default: 3)
-  },
   "kdf": {                                // Key derivation function
     "algorithm": "Argon2id",
     "version": "0x13",                    // Argon2 version 1.3
@@ -97,7 +102,14 @@ The header contains all encryption metadata in Protocol Buffer format:
   "salt": [32 bytes],                     // Random salt for key derivation
   "nonce": [8/16 bytes],                  // Base nonce for chunked encryption
   "chunk_size": 65536,                    // Chunk size in bytes (64KB default)
-  "archive": "tar"                        // Optional: Archive format (only present for directories)
+}
+
+// Private Header (encrypted as part of data stream)
+{
+  "compression": {                        // Optional compression configuration
+    "algorithm": "zstd"                   // Compression algorithm (if used)
+  },
+    "archive": "sec"                        // Optional: Archive format (only present for directories)
 }
 ```
 

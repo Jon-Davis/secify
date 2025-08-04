@@ -23,7 +23,6 @@ fn main() -> Result<()> {
     } else {
         Some(CompressionConfig {
             algorithm: cli.compression.to_string().to_owned(),
-            level: cli.compression_level,
         })
     };
     
@@ -62,7 +61,7 @@ fn main() -> Result<()> {
                 println!("Using encryption algorithm: {}", cli.algorithm.to_string());
                 
                 if let Some(ref comp_config) = compression_config {
-                    println!("Using compression: {} (level {})", comp_config.algorithm, comp_config.level);
+                    println!("Using compression: {}", comp_config.algorithm);
                 }
                 
                 println!("Using chunked encryption: {}KB chunks for optimal memory usage", 

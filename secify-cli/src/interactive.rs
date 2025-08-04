@@ -211,21 +211,8 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
         };
         
         if matches!(compression_alg, CompressionAlgorithm::Zstd) {
-            // Get compression level for zstd
-            let compression_level = loop {
-                let input = prompt_user("Compression level (1-22, default: 3, higher = better compression but slower): ")?;
-                if input.is_empty() {
-                    break 3; // New default level
-                }
-                match input.parse::<i32>() {
-                    Ok(level) if (1..=22).contains(&level) => break level,
-                    _ => println!("Invalid compression level. Please enter a value between 1 and 22."),
-                }
-            };
-            
             Some(CompressionConfig {
                 algorithm: compression_alg.to_string().to_owned(),
-                level: compression_level,
             })
         } else {
             None

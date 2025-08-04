@@ -17,18 +17,18 @@ use crate::error::{SecifyError, Result};
 const STREAM_BUFFER_SIZE: usize = 64 * 1024; // 64KB
 
 /// Maximum allowed protobuf header size (1MB)
-const MAX_HEADER_SIZE: usize = 1_048_576;
+const MAX_HEADER_SIZE: usize = 65_536;
 
 /// HMAC size in bytes (SHA256)
 const HMAC_SIZE: usize = 32;
 
-/// Custom archive format for minimal overhead
+/// Custom sec archive format for minimal overhead
 /// Format: [name_len: u32][name: utf8][size: u64][data]
-struct MinimalArchiveWriter<W: Write> {
+struct SecArchiveWriter<W: Write> {
     writer: W,
 }
 
-impl<W: Write> MinimalArchiveWriter<W> {
+impl<W: Write> SecArchiveWriter<W> {
     fn new(writer: W) -> Self {
         Self { writer }
     }
@@ -53,11 +53,11 @@ impl<W: Write> MinimalArchiveWriter<W> {
     }
 }
 
-struct MinimalArchiveReader<R: Read> {
+struct SecArchiveReader<R: Read> {
     reader: R,
 }
 
-impl<R: Read> MinimalArchiveReader<R> {
+impl<R: Read> SecArchiveReader<R> {
     fn new(reader: R) -> Self {
         Self { reader }
     }
@@ -498,7 +498,7 @@ impl<W: Write> CompressionBufferingWriter<W> {
             match CompressionAlgorithm::from_string(&config.algorithm)? {
                 CompressionAlgorithm::None => None,
                 CompressionAlgorithm::Zstd => {
-                    let encoder = zstd::Encoder::new(Vec::new(), config.level)?;
+                    let encoder = zstd::Encoder::new(Vec::new(), 3)?; // Use default level 3
                     Some(encoder)
                 }
             }
@@ -618,18 +618,22 @@ where
     let base_nonce = generate_base_nonce(algorithm)?;
     let key = derive_key_with_callback(password, &salt, argon2_params, log_callback)?;
 
-    // Create header - only use minimal archive format for directories
-    let archive_format = if is_directory { Some("minimal".to_string()) } else { None };
-    let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32, compression.clone(), archive_format);
+    // Create main header (encryption parameters only)
+    let header = create_encryption_header(&salt, &base_nonce, algorithm, argon2_params, DEFAULT_CHUNK_SIZE as u32);
     let protobuf_header = serialize_header_to_protobuf(&header)?;
+
+    // Create payload header (compression and archive info)
+        let archive_format = if is_directory { Some("sec".to_string()) } else { None };
+    let payload_header = create_payload_header(compression.clone(), archive_format.clone());
+    let payload_header_data = serialize_payload_header_to_protobuf(&payload_header)?;
 
     // Create output file
     let output_file = File::create(output_path)
         .map_err(|e| SecifyError::file_error(format!("Failed to create output file {}: {}", output_path, e)))?;
     let mut buffered_output = BufWriter::with_capacity(STREAM_BUFFER_SIZE, output_file);
 
-    // Write header length and header
-    buffered_output.write_all(&(protobuf_header.len() as u32).to_le_bytes())?;
+    // Write main header length and header
+    buffered_output.write_all(&(protobuf_header.len() as u16).to_le_bytes())?;
     buffered_output.write_all(&protobuf_header)?;
 
     // Create streaming encryption wrapper
@@ -641,30 +645,35 @@ where
         &salt,
     )?;
 
+    // Write encrypted payload header as first part of encrypted stream
+    encryption_writer.write_all(&(payload_header_data.len() as u16).to_le_bytes())?;
+    encryption_writer.write_all(&payload_header_data)?;
+
     progress_callback(EncryptProgress::EncryptionStarted);
 
     // Handle encryption based on whether we need archive format or not
-    if header.archive.is_some() {
-        // Directory: Use minimal archive format with compression pipeline
+    let has_archive = archive_format.is_some();
+    if has_archive {
+        // Directory: Use sec archive format with compression pipeline
         if compression.is_some() {
             let compression_writer = CompressionBufferingWriter::new(encryption_writer, compression.as_ref())?;
-            let mut archive_builder = MinimalArchiveWriter::new(compression_writer);
+            let mut archive_builder = SecArchiveWriter::new(compression_writer);
             
             // Process directory
-            process_directory_minimal(input_path_obj, &mut archive_builder, &progress_callback)?;
+            process_directory_sec(input_path_obj, &mut archive_builder, &progress_callback)?;
             
-            // Finalize the pipeline: MinimalArchive → Compression → Encryption → Output
+            // Finalize the pipeline: SecArchive → Compression → Encryption → Output
             let compression_writer = archive_builder.finish();
             let encryption_writer = compression_writer.finalize()?;
             let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
             final_output.flush().map_err(|e| SecifyError::Io(e))?;
         } else {
-            let mut archive_builder = MinimalArchiveWriter::new(encryption_writer);
+            let mut archive_builder = SecArchiveWriter::new(encryption_writer);
             
             // Process directory
-            process_directory_minimal(input_path_obj, &mut archive_builder, &progress_callback)?;
+            process_directory_sec(input_path_obj, &mut archive_builder, &progress_callback)?;
             
-            // Finalize the pipeline: MinimalArchive → Encryption → Output
+            // Finalize the pipeline: SecArchive → Encryption → Output
             let encryption_writer = archive_builder.finish();
             let (mut final_output, _hmac_bytes) = encryption_writer.finalize()?;
             final_output.flush().map_err(|e| SecifyError::Io(e))?;
@@ -740,11 +749,11 @@ where
         .map_err(|e| SecifyError::file_error(format!("Failed to open encrypted file {}: {}", input_path, e)))?;
     let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
 
-    // Read protobuf header length (first 4 bytes)
-    let mut header_length_bytes = [0u8; 4];
+    // Read protobuf header length (first 2 bytes)
+    let mut header_length_bytes = [0u8; 2];
     reader.read_exact(&mut header_length_bytes)
         .map_err(|e| SecifyError::invalid_format(format!("Failed to read protobuf header length from {}: {}", input_path, e)))?;
-    let header_length = u32::from_le_bytes(header_length_bytes) as usize;
+    let header_length = u16::from_le_bytes(header_length_bytes) as usize;
 
     // Validate header length
     if header_length == 0 {
@@ -784,13 +793,40 @@ where
     
     // For now, assume worst case (HMAC present) for initial size calculation
     // We'll adjust during verification based on actual chunk count
-    let ciphertext_size = total_file_size - 4 - header_length as u64; // Subtract header length and header data
+    let ciphertext_size = total_file_size - 2 - header_length as u64; // Subtract header length and header data
     
-    // Create encryption info for progress callback
+    // Create streaming decryption reader
+    let mut decryption_reader = StreamingDecryptionReader::new(
+        reader,
+        algorithm.clone(),
+        key,
+        header.nonce.clone(),
+        &header.salt,
+        ciphertext_size,
+    )?;
+    
+    // Read encrypted payload header (first part of encrypted stream)
+    let mut payload_header_len_bytes = [0u8; 2];
+    decryption_reader.read_exact(&mut payload_header_len_bytes)
+        .map_err(|e| SecifyError::invalid_format(format!("Failed to read payload header length: {}", e)))?;
+    let payload_header_len = u16::from_le_bytes(payload_header_len_bytes) as usize;
+    
+    if payload_header_len > MAX_HEADER_SIZE {
+        return Err(SecifyError::invalid_format(format!("Payload header too large: {} bytes", payload_header_len)));
+    }
+    
+    let mut payload_header_data = vec![0u8; payload_header_len];
+    decryption_reader.read_exact(&mut payload_header_data)
+        .map_err(|e| SecifyError::invalid_format(format!("Failed to read payload header data: {}", e)))?;
+    
+    let payload_header = deserialize_payload_header_from_protobuf(&payload_header_data)?;
+    validate_payload_header(&payload_header)?;
+    
+    // Create encryption info for progress callback (now with payload header info)
     let encryption_info = EncryptionInfo {
         version: header.version,
         algorithm: header.encryption_algorithm.clone(),
-        compression: header.compression.as_ref().map(|c| format!("{} (level {})", c.algorithm, c.level)),
+        compression: payload_header.compression.as_ref().map(|c| c.algorithm.clone()),
         kdf_info: format!("{} ({}MB, {} iterations, {} threads)", 
                          kdf.algorithm, 
                          kdf.memory_cost / 1024,
@@ -805,21 +841,11 @@ where
         total_bytes: ciphertext_size,
     });
     
-    // Create streaming decryption reader
-    let decryption_reader = StreamingDecryptionReader::new(
-        reader,
-        algorithm.clone(),
-        key,
-        header.nonce.clone(),
-        &header.salt,
-        ciphertext_size,
-    )?;
-    
     // Create progress-aware reader wrapper - pass reference to callback
     let progress_reader = ProgressAwareReader::new(decryption_reader, ciphertext_size, &progress_callback);
     
     // Create decompression reader if needed
-    let mut decompressed_reader: Box<dyn Read> = if let Some(ref compression) = header.compression {
+    let mut decompressed_reader: Box<dyn Read> = if let Some(ref compression) = payload_header.compression {
         let compression_alg = CompressionAlgorithm::from_string(&compression.algorithm)?;
         match compression_alg {
             CompressionAlgorithm::None => Box::new(progress_reader),
@@ -839,10 +865,10 @@ where
     }
 
     // Handle extraction based on archive format
-    if let Some(ref archive_format) = header.archive {
-        if archive_format == "minimal" {
-            // Minimal archive format (directory)
-            log_callback("Setting up streaming minimal archive extraction...");
+    if let Some(ref archive_format) = payload_header.archive {
+        if archive_format == "sec" {
+            // Sec archive format (directory)
+            log_callback("Setting up streaming sec archive extraction...");
             
             // Report extraction strategy as directory
             progress_callback(DecryptProgress::ExtractionStrategy {
@@ -854,8 +880,8 @@ where
             fs::create_dir_all(output_path)
                 .map_err(|e| SecifyError::file_error(format!("Failed to create output directory {}: {}", output_path, e)))?;
             
-            // Extract minimal archive
-            let mut archive_reader = MinimalArchiveReader::new(decompressed_reader);
+            // Extract sec archive
+            let mut archive_reader = SecArchiveReader::new(decompressed_reader);
             while let Some((name, size)) = archive_reader.next_entry()
                 .map_err(|e| SecifyError::archive(format!("Failed to read archive entry: {}", e)))? {
                 
@@ -913,7 +939,7 @@ where
     let mut verification_reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, verification_file);
     
     // Skip header
-    verification_reader.read_exact(&mut [0u8; 4])?; // header length
+    verification_reader.read_exact(&mut [0u8; 2])?; // header length
     let mut protobuf_skip = vec![0u8; header_length];
     verification_reader.read_exact(&mut protobuf_skip)?;
     
@@ -1001,9 +1027,9 @@ impl<'a, R: Read> Read for ProgressAwareReader<'a, R> {
 }
 
 /// Helper functions without UI dependencies
-fn process_directory_minimal<W: Write, P>(
+fn process_directory_sec<W: Write, P>(
     input_path: &Path,
-    archive_builder: &mut MinimalArchiveWriter<W>,
+    archive_builder: &mut SecArchiveWriter<W>,
     progress_callback: P,
 ) -> Result<()>
 where
@@ -1014,7 +1040,7 @@ where
     progress_callback(EncryptProgress::FileCountComplete { total_files });
     
     let mut processed_files = 0;
-    stream_minimal_directory_recursive(
+    stream_sec_directory_recursive(
         input_path,
         input_path,
         archive_builder,
@@ -1045,11 +1071,11 @@ fn count_files_in_directory_core(dir_path: &Path) -> Result<u64> {
     Ok(count)
 }
 
-/// Recursively add directory contents to minimal archive builder
-fn stream_minimal_directory_recursive<W: Write>(
+/// Recursively add directory contents to sec archive builder
+fn stream_sec_directory_recursive<W: Write>(
     base_path: &Path,
     current_path: &Path,
-    archive: &mut MinimalArchiveWriter<W>,
+    archive: &mut SecArchiveWriter<W>,
     processed_files: &mut u64,
     progress_callback: &dyn Fn(EncryptProgress),
 ) -> Result<()>
@@ -1078,7 +1104,7 @@ fn stream_minimal_directory_recursive<W: Write>(
             });
             
             // Recursively add directory contents
-            stream_minimal_directory_recursive(base_path, &path, archive, processed_files, &progress_callback)?;
+            stream_sec_directory_recursive(base_path, &path, archive, processed_files, &progress_callback)?;
         } else {
             // Add file to archive with streaming
             let file = File::open(&path)

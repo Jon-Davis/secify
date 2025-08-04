@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package secify;
 
+// Main header - contains minimal info needed to start decryption
 message EncryptionHeader {
   uint32 version = 1;
   string encryption_algorithm = 2;
@@ -9,8 +10,12 @@ message EncryptionHeader {
   bytes salt = 4;
   bytes nonce = 5;
   uint32 chunk_size = 6;
-  optional CompressionConfig compression = 7;
-  optional string archive = 8; // "minimal" for new format, "tar" for legacy
+}
+
+// Payload header - encrypted as part of the data stream
+message PayloadHeader {
+  optional CompressionConfig compression = 1;
+  optional string archive = 2; // "sec" for directories
 }
 
 message KeyDerivationConfig {
@@ -24,5 +29,4 @@ message KeyDerivationConfig {
 
 message CompressionConfig {
   string algorithm = 1;
-  int32 level = 2;
 }

@@ -1,7 +1,7 @@
 //! Secify Core Library
 //! 
 //! A library for creating and reading encrypted .sec files with streaming encryption,
-//! compression, and minimal archive format support.
+//! compression, and sec archive format support.
 //! 
 //! # Features
 //! 
@@ -53,7 +53,7 @@ pub mod error;
 pub use error::{SecifyError, Result};
 
 pub use crypto::{
-    EncryptionAlgorithm, CompressionAlgorithm, CompressionConfig, Argon2Params,
+    EncryptionAlgorithm, CompressionAlgorithm, RuntimeCompressionConfig, Argon2Params, CompressionConfig,
     encrypt_data, decrypt_data, derive_key, derive_key_with_callback, generate_secure_random_bytes,
     generate_base_nonce, create_encryption_header, validate_header,
     deserialize_header_from_protobuf, serialize_header_to_protobuf, parse_algorithm,

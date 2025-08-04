@@ -148,6 +148,12 @@ impl CompressionAlgorithm {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeCompressionConfig {
+    pub algorithm: String,
+    pub level: i32,
+}
+
 // Include the generated protobuf structs
 include!(concat!(env!("OUT_DIR"), "/secify.rs"));
 
@@ -347,7 +353,7 @@ pub fn decrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENG
     Ok(result)
 }
 
-pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32, compression: Option<CompressionConfig>, archive: Option<String>) -> EncryptionHeader {
+pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32) -> EncryptionHeader {
     let kdf = KeyDerivationConfig {
         algorithm: "Argon2id".to_owned(),
         version: "0x13".to_owned(),
@@ -357,11 +363,6 @@ pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &Encryptio
         output_length: KEY_LENGTH as u32,
     };
     
-    let compression_config = compression.map(|c| super::CompressionConfig {
-        algorithm: c.algorithm,
-        level: c.level,
-    });
-    
     EncryptionHeader {
         version: FILE_FORMAT_VERSION,
         encryption_algorithm: algorithm.to_string().to_owned(),
@@ -369,7 +370,12 @@ pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &Encryptio
         salt: salt.to_vec(),
         nonce: nonce.to_vec(),
         chunk_size,
-        compression: compression_config,
+    }
+}
+
+pub fn create_payload_header(compression: Option<CompressionConfig>, archive: Option<String>) -> PayloadHeader {
+    PayloadHeader {
+        compression,
         archive,
     }
 }
@@ -393,9 +399,21 @@ pub fn serialize_header_to_protobuf(header: &EncryptionHeader) -> Result<Vec<u8>
     Ok(buf)
 }
 
+pub fn serialize_payload_header_to_protobuf(payload_header: &PayloadHeader) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    payload_header.encode(&mut buf)
+        .map_err(|e| SecifyError::serialization(format!("Failed to encode payload header protobuf: {}", e)))?;
+    Ok(buf)
+}
+
 pub fn deserialize_header_from_protobuf(data: &[u8]) -> Result<EncryptionHeader> {
     EncryptionHeader::decode(data)
         .map_err(|e| SecifyError::serialization(format!("Failed to decode protobuf: {}", e)))
+}
+
+pub fn deserialize_payload_header_from_protobuf(data: &[u8]) -> Result<PayloadHeader> {
+    PayloadHeader::decode(data)
+        .map_err(|e| SecifyError::serialization(format!("Failed to decode payload header protobuf: {}", e)))
 }
 
 pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
@@ -435,18 +453,19 @@ pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
         return Err(SecifyError::invalid_config("Invalid chunk size: chunked encryption requires chunk_size > 0"));
     }
     
+    Ok(())
+}
+
+pub fn validate_payload_header(payload_header: &PayloadHeader) -> Result<()> {
     // Validate compression configuration if present
-    if let Some(compression) = &header.compression {
+    if let Some(compression) = &payload_header.compression {
         let compression_alg = CompressionAlgorithm::from_string(&compression.algorithm)?;
         match compression_alg {
             CompressionAlgorithm::None => {
                 // No compression is always valid
             }
             CompressionAlgorithm::Zstd => {
-                // Validate zstd compression level (1-22 is typical range)
-                if compression.level < 1 || compression.level > 22 {
-                    return Err(SecifyError::invalid_config(format!("Invalid zstd compression level: {}. Valid range is 1-22.", compression.level)));
-                }
+                // zstd compression is always valid - level validation happens at compression time
             }
         }
     }
@@ -690,7 +709,7 @@ mod tests {
         let params = create_fast_test_params();
         
         // Test file header (no archive field for single files)
-        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         assert_eq!(header.version, FILE_FORMAT_VERSION);
         assert_eq!(header.encryption_algorithm, "XChaCha20-Poly1305");
         let kdf = header.kdf.as_ref().expect("KDF should be present");
@@ -701,12 +720,16 @@ mod tests {
         assert_eq!(header.salt, salt.to_vec());
         assert_eq!(header.nonce, base_nonce);
         assert_eq!(header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
-        assert_eq!(header.archive, None); // Single file has no archive field
         
-        // Test directory header with minimal archive format
-        let archive_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, Some("minimal".to_string()));
-        assert_eq!(archive_header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
-        assert_eq!(archive_header.archive, Some("minimal".to_string())); // Directory has minimal archive field
+        // Test payload header creation
+        let payload_header = create_payload_header(None, None);
+        assert_eq!(payload_header.compression, None); // Single file has no compression
+        assert_eq!(payload_header.archive, None); // Single file has no archive field
+        
+        // Test directory payload header with sec archive format
+        let archive_payload_header = create_payload_header(None, Some("sec".to_string()));
+        assert_eq!(archive_payload_header.compression, None);
+        assert_eq!(archive_payload_header.archive, Some("sec".to_string())); // Directory has sec archive field
     }
 
     #[test]
@@ -715,7 +738,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let original_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        let original_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Serialize to protobuf
         let protobuf_data = serialize_header_to_protobuf(&original_header).unwrap();
@@ -740,7 +763,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Valid header should pass validation
         assert!(validate_header(&header).is_ok());
@@ -752,7 +775,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid version
         header.version = FILE_FORMAT_VERSION + 1;
@@ -765,7 +788,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid algorithm
         header.encryption_algorithm = "Invalid-Algorithm".to_string();
@@ -778,7 +801,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid KDF
         if let Some(ref mut kdf) = header.kdf {
@@ -793,7 +816,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid salt length
         header.salt = vec![1u8; 16]; // Wrong length
@@ -806,7 +829,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+        let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
         // Set invalid nonce length (AES-GCM expects 8-byte base nonce, so use 4 bytes to make it invalid)
         header.nonce = vec![2u8; 4]; // Wrong length for AES-GCM base nonce
@@ -1152,7 +1175,7 @@ mod tests {
         let salt = create_test_salt();
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
-        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, 0, None, None);
+        let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, 0);
         
         // Zero chunk size should be invalid
         assert!(validate_header(&header).is_err());
@@ -1170,7 +1193,7 @@ mod tests {
             let salt = create_test_salt();
             let base_nonce = create_test_base_nonce(algorithm);
             let params = create_fast_test_params();
-            let original_header = create_encryption_header(&salt, &base_nonce, algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
+            let original_header = create_encryption_header(&salt, &base_nonce, algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
             
             // Serialize and deserialize
             let protobuf_data = serialize_header_to_protobuf(&original_header).unwrap();
@@ -1194,19 +1217,20 @@ mod tests {
         let base_nonce = create_test_base_nonce(&algorithm);
         let params = create_fast_test_params();
         
-        // Single file header (no archive field)
-        let single_file_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, None);
-        assert_eq!(single_file_header.archive, None);
+        // Public header (encryption info only - no archive field)
+        let public_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
-        // Directory header (with archive field)
-        let directory_header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32, None, Some("minimal".to_string()));
-        assert_eq!(directory_header.archive, Some("minimal".to_string()));
+        // Single file payload header (no archive field)
+        let single_file_payload = create_payload_header(None, None);
+        assert_eq!(single_file_payload.archive, None);
         
-        // Verify basic header fields are correct for both
-        assert_eq!(single_file_header.version, FILE_FORMAT_VERSION);
-        assert_eq!(single_file_header.encryption_algorithm, algorithm.to_string());
-        assert_eq!(directory_header.version, FILE_FORMAT_VERSION);
-        assert_eq!(directory_header.encryption_algorithm, algorithm.to_string());
+        // Directory payload header (with archive field)
+        let directory_payload = create_payload_header(None, Some("sec".to_string()));
+        assert_eq!(directory_payload.archive, Some("sec".to_string()));
+        
+        // Verify basic header fields are correct
+        assert_eq!(public_header.version, FILE_FORMAT_VERSION);
+        assert_eq!(public_header.encryption_algorithm, algorithm.to_string());
     }
 
     #[test]
