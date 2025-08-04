@@ -14,7 +14,7 @@ use prost::Message;
 // Constants
 pub const SALT_LENGTH: usize = 32;
 pub const KEY_LENGTH: usize = 32;
-pub const FILE_FORMAT_VERSION: u32 = 1;
+pub const FILE_FORMAT_VERSION: u32 = 0;
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB limit to prevent OOM
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks for streaming encryption
 

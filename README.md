@@ -76,7 +76,7 @@ The public header contains encryption metadata in Protocol Buffer format:
 ```rust
 // Public Header (unencrypted)
 {
-  "version": 1,                           // File format version
+  "version": 0,                           // File format version
   "encryption_algorithm": "AES-256-GCM",  // Encryption method
   "kdf": {                                // Key derivation function
     "algorithm": "Argon2id",
