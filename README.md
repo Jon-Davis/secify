@@ -96,7 +96,7 @@ The public header contains encryption metadata in Protocol Buffer format:
   "compression": {                        // Optional compression configuration
     "algorithm": "zstd"                   // Compression algorithm (if used)
   },
-    "archive": "sec"                        // Optional: Archive format (only present for directories)
+  "archive": "sec"                        // Optional: Archive format (only present for directories)
 }
 ```
 
@@ -123,7 +123,6 @@ Data is encrypted in fixed-size chunks for efficient streaming and memory usage.
 **Format Benefits:**
 - **Fixed-Size Chunks**: Each encrypted chunk (except the last) is exactly `chunk_size` bytes
 - **Streaming-Friendly**: No need to know total data length upfront - process chunks as they arrive
-- **Natural Termination**: Decryption completes when ciphertext is exhausted
 
 **Chunk Details:**
 - **Plaintext per chunk**: `chunk_size - 16 bytes` (e.g., 64KB chunk = 65520 bytes plaintext + 16 byte auth tag)

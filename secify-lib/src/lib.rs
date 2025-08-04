@@ -17,6 +17,7 @@
 //! 
 //! ```rust
 //! use secify_lib::{encrypt_core, decrypt_core, EncryptionAlgorithm, Argon2Params, Result};
+//! use std::sync::Arc;
 //! 
 //! fn example() -> Result<()> {
 //!     // Encrypt a file
@@ -28,7 +29,7 @@
 //!         &EncryptionAlgorithm::XChaCha20Poly1305,
 //!         &params,
 //!         None, // No compression
-//!         &|progress| println!("Encrypt progress: {:?}", progress),
+//!         Arc::new(|progress| println!("Encrypt progress: {:?}", progress)),
 //!         &|msg| println!("Log: {}", msg),
 //!     )?;
 //!     
@@ -37,7 +38,7 @@
 //!         "output.sec",
 //!         "restored.txt",
 //!         "password", 
-//!         &|progress| println!("Decrypt progress: {:?}", progress),
+//!         Arc::new(|progress| println!("Decrypt progress: {:?}", progress)),
 //!         &|msg| println!("Log: {}", msg),
 //!     )?;
 //!     
@@ -48,6 +49,10 @@
 pub mod crypto;
 pub mod core;
 pub mod error;
+pub mod archive;
+pub mod progress;
+pub mod compression;
+pub mod streaming;
 
 // Re-export the main types and functions for convenience
 pub use error::{SecifyError, Result};
@@ -62,15 +67,31 @@ pub use crypto::{
 
 pub use core::{
     encrypt_core, decrypt_core,
+};
+
+pub use streaming::{
+    StreamingEncryptionWriter, StreamingDecryptionReader,
+};
+
+pub use progress::{
     EncryptProgress, DecryptProgress, EncryptionInfo,
-    StreamingEncryptionWriter, StreamingDecryptionReader, CompressionBufferingWriter,
-    EncryptProgressCallback, DecryptProgressCallback, LogCallback
+    EncryptProgressCallback, DecryptProgressCallback, LogCallback,
+    ProgressAwareReader
+};
+
+pub use archive::{
+    SecArchiveWriter, SecArchiveReader, process_directory_sec
+};
+
+pub use compression::{
+    CompressionBufferingWriter, create_decompression_reader
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -94,7 +115,7 @@ mod tests {
             &algorithm,
             &params,
             None,
-            &|_| {}, // Progress callback
+            Arc::new(|_| {}), // Progress callback
             &|_| {}, // Log callback
         ).unwrap();
         
@@ -105,7 +126,7 @@ mod tests {
             encrypted_file.to_str().unwrap(),
             decrypted_file.to_str().unwrap(),
             "test_password",
-            &|_| {}, // Progress callback
+            Arc::new(|_| {}), // Progress callback
             &|_| {}, // Log callback
         ).unwrap();
         

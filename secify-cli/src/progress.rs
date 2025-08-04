@@ -3,6 +3,7 @@
 //! This module wraps the core library functions with progress bars and console output.
 
 use std::time::Instant;
+use std::sync::Arc;
 use std::rc::Rc;
 use std::cell::RefCell;
 use secify_lib::{
@@ -107,7 +108,7 @@ pub fn encrypt_with_ui(
         algorithm,
         argon2_params,
         compression,
-        &progress_callback,
+        Arc::new(progress_callback),
         &log_callback,
     );
     
@@ -194,7 +195,7 @@ pub fn decrypt_with_ui(
         input_path,
         output_path,
         password,
-        &progress_callback,
+        Arc::new(progress_callback),
         &log_callback,
     );
     

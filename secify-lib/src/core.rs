@@ -6,12 +6,16 @@
 use std::fs::{self, File};
 use std::path::Path;
 use std::io::{Read, Write, BufReader, BufWriter, Seek};
+use std::sync::Arc;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use zstd;
 
 use crate::crypto::*;
 use crate::error::{SecifyError, Result};
+use crate::archive::{SecArchiveWriter, SecArchiveReader, process_directory_sec};
+use crate::compression::{CompressionBufferingWriter, create_decompression_reader};
+use crate::progress::{EncryptProgress, DecryptProgress, EncryptionInfo, ProgressAwareReader};
+use crate::streaming::create_streaming_chunk_nonce;
 
 /// Size of the read buffer for streaming operations
 const STREAM_BUFFER_SIZE: usize = 64 * 1024; // 64KB
@@ -21,147 +25,6 @@ const MAX_HEADER_SIZE: usize = 65_536;
 
 /// HMAC size in bytes (SHA256)
 const HMAC_SIZE: usize = 32;
-
-/// Custom sec archive format for minimal overhead
-/// Format: [name_len: u32][name: utf8][size: u64][data]
-struct SecArchiveWriter<W: Write> {
-    writer: W,
-}
-
-impl<W: Write> SecArchiveWriter<W> {
-    fn new(writer: W) -> Self {
-        Self { writer }
-    }
-    
-    fn add_file(&mut self, path: &str, size: u64, mut reader: impl Read) -> std::io::Result<()> {
-        // Write name length and name
-        let name_bytes = path.as_bytes();
-        self.writer.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
-        self.writer.write_all(name_bytes)?;
-        
-        // Write file size
-        self.writer.write_all(&size.to_le_bytes())?;
-        
-        // Copy file data
-        std::io::copy(&mut reader, &mut self.writer)?;
-        
-        Ok(())
-    }
-    
-    fn finish(self) -> W {
-        self.writer
-    }
-}
-
-struct SecArchiveReader<R: Read> {
-    reader: R,
-}
-
-impl<R: Read> SecArchiveReader<R> {
-    fn new(reader: R) -> Self {
-        Self { reader }
-    }
-    
-    fn next_entry(&mut self) -> std::io::Result<Option<(String, u64)>> {
-        // Try to read name length
-        let mut name_len_bytes = [0u8; 4];
-        match self.reader.read_exact(&mut name_len_bytes) {
-            Ok(()) => {},
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        
-        let name_len = u32::from_le_bytes(name_len_bytes) as usize;
-        if name_len > 4096 { // Sanity check
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Name too long"));
-        }
-        
-        // Read name
-        let mut name_bytes = vec![0u8; name_len];
-        self.reader.read_exact(&mut name_bytes)?;
-        let name = String::from_utf8(name_bytes)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in filename"))?;
-        
-        // Read file size
-        let mut size_bytes = [0u8; 8];
-        self.reader.read_exact(&mut size_bytes)?;
-        let size = u64::from_le_bytes(size_bytes);
-        
-        Ok(Some((name, size)))
-    }
-    
-    fn read_file_data(&mut self, size: u64, mut writer: impl Write) -> std::io::Result<()> {
-        let mut remaining = size;
-        let mut buffer = vec![0u8; 64 * 1024]; // 64KB buffer
-        
-        while remaining > 0 {
-            let to_read = std::cmp::min(buffer.len() as u64, remaining) as usize;
-            let bytes_read = self.reader.read(&mut buffer[..to_read])?;
-            if bytes_read == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Unexpected end of archive"));
-            }
-            
-            writer.write_all(&buffer[..bytes_read])?;
-            remaining -= bytes_read as u64;
-        }
-        
-        Ok(())
-    }
-}
-
-/// Progress callback for encryption operations
-pub type EncryptProgressCallback<'a> = &'a dyn Fn(EncryptProgress);
-
-/// Progress callback for decryption operations  
-pub type DecryptProgressCallback<'a> = &'a dyn Fn(DecryptProgress);
-
-/// Logging callback for informational messages
-pub type LogCallback<'a> = &'a dyn Fn(&str);
-
-/// Progress information during encryption
-#[derive(Debug, Clone)]
-pub enum EncryptProgress {
-    /// Starting operation
-    Starting { is_directory: bool, has_compression: bool },
-    /// Counting files in directory
-    CountingFiles,
-    /// File counting complete
-    FileCountComplete { total_files: u64 },
-    /// Processing a file or directory
-    ProcessingFile { current: u64, total: u64, name: String },
-    /// Encryption pipeline started
-    EncryptionStarted,
-    /// Encryption complete
-    EncryptionComplete,
-}
-
-/// Progress information during decryption
-#[derive(Debug, Clone)]
-pub enum DecryptProgress {
-    /// Header validation complete, starting decryption
-    DecryptionStarted { 
-        encryption_info: EncryptionInfo,
-        total_bytes: u64,
-    },
-    /// Bytes processed during decryption/extraction
-    BytesProcessed { current: u64, total: u64 },
-    /// Extraction type determined
-    ExtractionStrategy { is_single_file: bool, output_path: String },
-    /// HMAC verification started
-    VerifyingIntegrity,
-    /// Decryption and extraction complete
-    DecryptionComplete,
-}
-
-/// Encryption information extracted from header
-#[derive(Debug, Clone)]
-pub struct EncryptionInfo {
-    pub version: u32,
-    pub algorithm: String,
-    pub compression: Option<String>,
-    pub kdf_info: String,
-    pub chunk_size: u32,
-}
 
 /// Core streaming encryption writer without UI dependencies
 pub struct StreamingEncryptionWriter<W: Write> {
@@ -479,112 +342,6 @@ impl<R: Read> Read for StreamingDecryptionReader<R> {
     }
 }
 
-/// Compression wrapper without UI dependencies
-pub struct CompressionBufferingWriter<W: Write> {
-    inner: StreamingEncryptionWriter<W>,
-    compression_buffer: Vec<u8>,
-    compression_encoder: Option<zstd::Encoder<'static, Vec<u8>>>,
-    chunk_size: usize,
-}
-
-impl<W: Write> CompressionBufferingWriter<W> {
-    pub fn new(
-        inner: StreamingEncryptionWriter<W>,
-        compression: Option<&CompressionConfig>,
-    ) -> Result<Self> {
-        let chunk_size = DEFAULT_CHUNK_SIZE - 16; // Account for auth tag
-        
-        let compression_encoder = if let Some(config) = compression {
-            match CompressionAlgorithm::from_string(&config.algorithm)? {
-                CompressionAlgorithm::None => None,
-                CompressionAlgorithm::Zstd => {
-                    let encoder = zstd::Encoder::new(Vec::new(), 3)?; // Use default level 3
-                    Some(encoder)
-                }
-            }
-        } else {
-            None
-        };
-        
-        Ok(Self {
-            inner,
-            compression_buffer: Vec::new(),
-            compression_encoder,
-            chunk_size,
-        })
-    }
-    
-    /// Helper method to handle compression output and buffer management
-    fn handle_compression_output(&mut self) -> Result<()> {
-        if let Some(ref mut encoder) = self.compression_encoder {
-            let compressed_output = encoder.get_ref();
-            if !compressed_output.is_empty() {
-                self.compression_buffer.extend_from_slice(compressed_output);
-                *encoder.get_mut() = Vec::new();
-                self.flush_compressed_chunks()?;
-            }
-        }
-        Ok(())
-    }
-    
-    fn flush_compressed_chunks(&mut self) -> Result<()> {
-        // Extract full chunks from compression buffer and send to encryption
-        while self.compression_buffer.len() >= self.chunk_size {
-            let chunk = self.compression_buffer.drain(..self.chunk_size).collect::<Vec<u8>>();
-            self.inner.write_all(&chunk)?;
-        }
-        Ok(())
-    }
-    
-    pub fn finalize(mut self) -> Result<StreamingEncryptionWriter<W>> {
-        // Finalize compression if enabled
-        if let Some(encoder) = self.compression_encoder.take() {
-            let final_compressed = encoder.finish()?;
-            self.compression_buffer.extend_from_slice(&final_compressed);
-        }
-        
-        // Flush all remaining compressed data
-        if !self.compression_buffer.is_empty() {
-            self.inner.write_all(&self.compression_buffer)?;
-        }
-        
-        Ok(self.inner)
-    }
-}
-
-impl<W: Write> Write for CompressionBufferingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(ref mut encoder) = self.compression_encoder {
-            // Write to the compression encoder (it implements Write trait)
-            encoder.write_all(buf)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            
-            // Handle compression output using helper method
-            self.handle_compression_output()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        } else {
-            // No compression - pass through directly to encryption
-            self.inner.write(buf)?;
-        }
-        
-        Ok(buf.len())
-    }
-    
-    fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(ref mut encoder) = self.compression_encoder {
-            // Flush compression encoder
-            encoder.flush()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            
-            // Handle compression output using helper method
-            self.handle_compression_output()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        }
-        
-        self.inner.flush()
-    }
-}
-
 /// Core encryption function without UI dependencies
 pub fn encrypt_core<P, L>(
     input_path: &str,
@@ -593,11 +350,11 @@ pub fn encrypt_core<P, L>(
     algorithm: &EncryptionAlgorithm,
     argon2_params: &Argon2Params,
     compression: Option<CompressionConfig>,
-    progress_callback: &P,
+    progress_callback: Arc<P>,
     log_callback: &L,
 ) -> Result<()>
 where
-    P: Fn(EncryptProgress),
+    P: Fn(EncryptProgress) + 'static,
     L: Fn(&str),
 {
     let input_path_obj = Path::new(input_path);
@@ -660,7 +417,7 @@ where
             let mut archive_builder = SecArchiveWriter::new(compression_writer);
             
             // Process directory
-            process_directory_sec(input_path_obj, &mut archive_builder, &progress_callback)?;
+            process_directory_sec(input_path_obj, &mut archive_builder, |progress| progress_callback(progress))?;
             
             // Finalize the pipeline: SecArchive → Compression → Encryption → Output
             let compression_writer = archive_builder.finish();
@@ -671,7 +428,7 @@ where
             let mut archive_builder = SecArchiveWriter::new(encryption_writer);
             
             // Process directory
-            process_directory_sec(input_path_obj, &mut archive_builder, &progress_callback)?;
+            process_directory_sec(input_path_obj, &mut archive_builder, |progress| progress_callback(progress))?;
             
             // Finalize the pipeline: SecArchive → Encryption → Output
             let encryption_writer = archive_builder.finish();
@@ -737,11 +494,11 @@ pub fn decrypt_core<P, L>(
     input_path: &str,
     output_path: &str,
     password: &str,
-    progress_callback: &P,
+    progress_callback: Arc<P>,
     log_callback: &L,
 ) -> Result<()>
 where
-    P: Fn(DecryptProgress),
+    P: Fn(DecryptProgress) + 'static,
     L: Fn(&str),
 {
     // Open encrypted file and buffer for streaming
@@ -841,20 +598,13 @@ where
         total_bytes: ciphertext_size,
     });
     
-    // Create progress-aware reader wrapper - pass reference to callback
-    let progress_reader = ProgressAwareReader::new(decryption_reader, ciphertext_size, &progress_callback);
+    // Create progress-aware reader wrapper - clone the Arc
+    let progress_reader = ProgressAwareReader::new(decryption_reader, ciphertext_size, progress_callback.clone());
     
     // Create decompression reader if needed
     let mut decompressed_reader: Box<dyn Read> = if let Some(ref compression) = payload_header.compression {
-        let compression_alg = CompressionAlgorithm::from_string(&compression.algorithm)?;
-        match compression_alg {
-            CompressionAlgorithm::None => Box::new(progress_reader),
-            CompressionAlgorithm::Zstd => {
-                log_callback("Setting up streaming decompression with zstd...");
-                Box::new(zstd::Decoder::new(progress_reader)
-                    .map_err(|e| SecifyError::decompression(format!("Failed to create zstd decoder: {}", e)))?)
-            }
-        }
+        log_callback("Setting up streaming decompression...");
+        create_decompression_reader(progress_reader, Some(compression))?
     } else {
         Box::new(progress_reader)
     };
@@ -995,167 +745,6 @@ where
     Ok(())
 }
 
-/// Progress-aware reader wrapper that reports bytes read
-struct ProgressAwareReader<'a, R: Read> {
-    inner: R,
-    bytes_read: u64,
-    total_bytes: u64,
-    progress_callback: &'a dyn Fn(DecryptProgress),
-}
-
-impl<'a, R: Read> ProgressAwareReader<'a, R> {
-    fn new(inner: R, total_bytes: u64, progress_callback: &'a dyn Fn(DecryptProgress)) -> Self {
-        Self {
-            inner,
-            bytes_read: 0,
-            total_bytes,
-            progress_callback,
-        }
-    }
-}
-
-impl<'a, R: Read> Read for ProgressAwareReader<'a, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let bytes_read = self.inner.read(buf)?;
-        self.bytes_read += bytes_read as u64;
-        (self.progress_callback)(DecryptProgress::BytesProcessed {
-            current: self.bytes_read,
-            total: self.total_bytes,
-        });
-        Ok(bytes_read)
-    }
-}
-
-/// Helper functions without UI dependencies
-fn process_directory_sec<W: Write, P>(
-    input_path: &Path,
-    archive_builder: &mut SecArchiveWriter<W>,
-    progress_callback: P,
-) -> Result<()>
-where
-    P: Fn(EncryptProgress),
-{
-    progress_callback(EncryptProgress::CountingFiles);
-    let total_files = count_files_in_directory_core(input_path)?;
-    progress_callback(EncryptProgress::FileCountComplete { total_files });
-    
-    let mut processed_files = 0;
-    stream_sec_directory_recursive(
-        input_path,
-        input_path,
-        archive_builder,
-        &mut processed_files,
-        &progress_callback,
-    )?;
-    Ok(())
-}
-
-/// Count files in directory recursively for progress tracking
-fn count_files_in_directory_core(dir_path: &Path) -> Result<u64> {
-    let mut count = 0;
-    let entries = fs::read_dir(dir_path)
-        .map_err(|e| SecifyError::file_error(format!("Failed to read directory {}: {}", dir_path.display(), e)))?;
-    
-    for entry in entries {
-        let entry = entry.map_err(|e| SecifyError::file_error(format!("Failed to read directory entry: {}", e)))?;
-        let path = entry.path();
-        
-        if path.is_dir() {
-            count += 1; // Count the directory itself
-            count += count_files_in_directory_core(&path)?; // Recursively count contents
-        } else {
-            count += 1; // Count the file
-        }
-    }
-    
-    Ok(count)
-}
-
-/// Recursively add directory contents to sec archive builder
-fn stream_sec_directory_recursive<W: Write>(
-    base_path: &Path,
-    current_path: &Path,
-    archive: &mut SecArchiveWriter<W>,
-    processed_files: &mut u64,
-    progress_callback: &dyn Fn(EncryptProgress),
-) -> Result<()>
-{
-    let entries = fs::read_dir(current_path)
-        .map_err(|e| SecifyError::file_error(format!("Failed to read directory {}: {}", current_path.display(), e)))?;
-    
-    for entry in entries {
-        let entry = entry.map_err(|e| SecifyError::file_error(format!("Failed to read directory entry: {}", e)))?;
-        let path = entry.path();
-        let relative_path = path.strip_prefix(base_path)
-            .map_err(|e| SecifyError::file_error(format!("Failed to create relative path: {}", e)))?;
-        
-        if path.is_dir() {
-            // For directories, add a special entry with "/" suffix and zero size
-            let dir_name = format!("{}/", relative_path.display());
-            archive.add_file(&dir_name, 0, std::io::empty())
-                .map_err(|e| SecifyError::archive(format!("Failed to add directory to archive {}: {}", dir_name, e)))?;
-            
-            // Update progress
-            *processed_files += 1;
-            progress_callback(EncryptProgress::ProcessingFile { 
-                current: *processed_files, 
-                total: 0, // We'll update this when we know the total
-                name: relative_path.display().to_string() 
-            });
-            
-            // Recursively add directory contents
-            stream_sec_directory_recursive(base_path, &path, archive, processed_files, &progress_callback)?;
-        } else {
-            // Add file to archive with streaming
-            let file = File::open(&path)
-                .map_err(|e| SecifyError::file_error(format!("Failed to open file {}: {}", path.display(), e)))?;
-            
-            let metadata = file.metadata()
-                .map_err(|e| SecifyError::file_error(format!("Failed to get file metadata {}: {}", path.display(), e)))?;
-            let file_size = metadata.len();
-            
-            archive.add_file(&relative_path.display().to_string(), file_size, file)
-                .map_err(|e| SecifyError::archive(format!("Failed to add file to archive {}: {}", relative_path.display(), e)))?;
-            
-            // Update progress
-            *processed_files += 1;
-            progress_callback(EncryptProgress::ProcessingFile { 
-                current: *processed_files, 
-                total: 0, // We'll update this when we know the total
-                name: relative_path.display().to_string() 
-            });
-        }
-    }
-    
-    Ok(())
-}
-
-/// Create a chunk nonce for streaming encryption/decryption
-fn create_streaming_chunk_nonce(algorithm: &EncryptionAlgorithm, base_nonce: &[u8], chunk_counter: u64) -> Result<Vec<u8>> {
-    let nonce_length = algorithm.nonce_length();
-    let mut chunk_nonce = vec![0u8; nonce_length];
-    
-    match algorithm {
-        EncryptionAlgorithm::Aes256Gcm | EncryptionAlgorithm::ChaCha20Poly1305 => {
-            if base_nonce.len() != 8 {
-                return Err(SecifyError::invalid_config(format!("Base nonce for {}/ChaCha20 must be 8 bytes, got {}", 
-                      algorithm.to_string(), base_nonce.len())));
-            }
-            chunk_nonce[..8].copy_from_slice(base_nonce);
-            chunk_nonce[8..12].copy_from_slice(&(chunk_counter as u32).to_le_bytes());
-        }
-        EncryptionAlgorithm::XChaCha20Poly1305 => {
-            if base_nonce.len() != 16 {
-                return Err(SecifyError::invalid_config(format!("Base nonce for XChaCha20 must be 16 bytes, got {}", base_nonce.len())));
-            }
-            chunk_nonce[..16].copy_from_slice(base_nonce);
-            chunk_nonce[16..24].copy_from_slice(&chunk_counter.to_le_bytes());
-        }
-    }
-    
-    Ok(chunk_nonce)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,7 +780,7 @@ mod tests {
             &algorithm,
             &params,
             None,
-            &|_| {}, // No progress tracking in test
+            Arc::new(|_| {}), // No progress tracking in test
             &|_| {}, // No logging in test
         ).unwrap();
         
@@ -1200,7 +789,7 @@ mod tests {
             encrypted_file.to_str().unwrap(),
             decrypted_file.to_str().unwrap(),
             TEST_PASSWORD,
-            &|_| {}, // No progress tracking in test
+            Arc::new(|_| {}), // No progress tracking in test
             &|_| {}, // No logging in test
         ).unwrap();
         
