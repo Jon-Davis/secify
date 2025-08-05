@@ -38,7 +38,7 @@ The `.sec` format is a binary container with the following structure:
 ├──────────────────────────────────────────────────────────────┤
 │ Private Header Len│ 2 bytes (little-endian u16)              │ ──┐
 ├──────────────────────────────────────────────────────────────┤   │
-│ Private Header    │ Variable length (encrypted metadata)     │ ──┤ Encrypted
+│ Private Header    │ Variable length (optional)               │ ──┤ Encrypted
 ├──────────────────────────────────────────────────────────────┤   │
 │ Data              │ Variable length (optionally compressed)  │ ──┘
 ├──────────────────────────────────────────────────────────────┤
