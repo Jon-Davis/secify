@@ -6,7 +6,7 @@ Secify is a secure file encryption tool. It encrypts files or directories into `
 
 ## Features
 
-- Encryption algorithms: AES-256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305
+- Encryption algorithms: AES-256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305 (default)
 - Optional compression (zstd)
 - Directory support with custom archive format
 - Streaming architecture: constant memory usage, no temp files
@@ -36,11 +36,11 @@ The `.sec` format is a binary container with the following structure:
 ├──────────────────────────────────────────────────────────────┤
 │ Public Header     │ Variable length (encryption info only)   │
 ├──────────────────────────────────────────────────────────────┤
-│ Private Header Len│ 2 bytes (little-endian u16)              │
-├──────────────────────────────────────────────────────────────┤
-│ Private Header    │ Variable length (encrypted metadata)     │
-├──────────────────────────────────────────────────────────────┤
-│ Encrypted Data    │ Variable length (optionally compressed)  │
+│ Private Header Len│ 2 bytes (little-endian u16)              │ ──┐
+├──────────────────────────────────────────────────────────────┤   │
+│ Private Header    │ Variable length (encrypted metadata)     │ ──┤ Encrypted
+├──────────────────────────────────────────────────────────────┤   │
+│ Data              │ Variable length (optionally compressed)  │ ──┘
 ├──────────────────────────────────────────────────────────────┤
 │ File HMAC         │ 32 bytes (HMAC-SHA256, multi-chunk only) │
 └──────────────────────────────────────────────────────────────┘
@@ -59,14 +59,14 @@ Public and private headers use Protocol Buffer format:
 ```rust
 // Public Header (unencrypted)
 {
-  "version": 0,                            // File format version
-  "encryption_algorithm": "AES-256-GCM",   // Encryption method
-  "kdf_config": {                          // Key derivation configuration
-    "standard_kdf": "ARGON2ID_RECOMMENDED" // Preset (2GB, 1 iter, 4 threads)
+  "version": 0,                                   // File format version
+  "encryption_algorithm": "XChaCha20-Poly1305",   // Encryption method
+  "kdf_config": {                                 // Key derivation configuration
+    "standard_kdf": "ARGON2ID_RECOMMENDED"        // Preset (2GB, 1 iter, 4 threads)
   },
-  "salt": [32 bytes],                      // Random salt for key derivation
-  "nonce": [8/16 bytes],                   // Base nonce for chunked encryption
-  "chunk_size": 65536,                     // Chunk size in bytes (64KB default)
+  "salt": [32 bytes],                             // Random salt for key derivation
+  "nonce": [8/16 bytes],                          // Base nonce for chunked encryption
+  "chunk_size": 65536,                            // Chunk size in bytes (64KB default)
 }
 
 // Private Header (encrypted as part of data stream)
