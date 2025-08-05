@@ -1,43 +1,28 @@
 # Secify
 
-**Secify** is a secure file encryption program. It transforms any file or folder into an encrypted `.sec` container that can only be opened with the correct password.
+Secify is a secure file encryption tool. It encrypts files or directories into `.sec` containers that require a password.
 
-## Note
-This is just a personal project, to explore different encryption methods.
+**NOTE**: This is just a personal project to explore encryption technologies
 
-## Key Features
+## Features
 
-- **Multiple Encryption Algorithms**: AES-256-GCM, ChaCha20-Poly1305, and XChaCha20-Poly1305
-- **Optional Compression**: Zstandard (zstd) compression enabled by default (level 3) for smaller encrypted files
-- **Directory Support**: Encrypts entire folders while preserving structure
-- **Fully Streaming Architecture**: Process files of any size with constant memory usage
-  
-### Algorithm Selection
-- **XChaCha20-Poly1305** (default): 192-bit nonce prevents collisions
-- **AES-256-GCM**: Hardware accelerated on most modern CPUs
-- **ChaCha20-Poly1305**: Faster on mobile and older processors
-
-### Argon2id Key Derivation
-Secify uses Argon2id for key derivation with three preset configurations:
-
-- **argon2id_recommended** (default): 2GB memory, 1 iteration, 4 threads - High security for modern systems
-- **argon2id_constrained**: 64MB memory, 3 iterations, 4 threads - Resource-constrained environments
-- **argon2id_custom**: Fully customizable parameters (8-2048 MB memory, 1-100 iterations, 1-16 threads)
+- Encryption algorithms: AES-256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305
+- Optional compression (zstd level 3)
+- Directory support with custom archive format
+- Streaming architecture: constant memory usage, no temp files
+- Argon2id key derivation with recommended, constrained, and custom presets
 
 ## File Format: Securely Encrypted Container (.sec)
 
 ### Streaming Architecture
 
-Secify implements a fully streaming pipeline for optimal memory efficiency:
+Streaming pipeline: Read → [Archive] → Compress → Encrypt → Write
 
-**Read → [Archive] → Compress → Encrypt → Write Pipeline:**
-- **Single Files**: Content is read in chunks, optionally compressed, then encrypted and written directly (no archive overhead)
-- **Directories**: Files are recursively added to custom archive stream, optionally compressed, encrypted on-the-fly, and written incrementally
-- **Memory Usage**: Constant memory usage regardless of file/directory size (only chunk-size buffers)
-- **Performance**: No temporary files, no full-data buffering, immediate processing of each chunk
-- **Compression**: Optional zstd compression reduces file size at the cost of CPU time
-
-This streaming approach enables encryption of arbitrarily large files and directories without memory constraints, while minimizing overhead for single files.
+- Single files: chunked, optionally compressed, encrypted directly
+- Directories: archived to custom format, optionally compressed, encrypted
+- Constant memory usage (chunk-size buffers only)
+- No temporary files or full-data buffering
+- Optional zstd compression
 
 ### Format Specification
 
@@ -61,17 +46,15 @@ The `.sec` format is a binary container with the following structure:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The format uses a **split header design** for enhanced security:
-- **Public Header**: Contains only encryption parameters needed to start decryption
-- **Private Header**: Contains compression and archive metadata, encrypted as part of the data stream
+The format uses a split header design:
+- Public Header: encryption parameters (unencrypted)
+- Private Header: compression and archive metadata (encrypted)
 
-This ensures that metadata about the file structure is protected and cannot be analyzed without the password.
-
-**Note:** Single-chunk files omit the HMAC section entirely, relying on AEAD authentication for integrity.
+Single-chunk files omit the HMAC section, relying on AEAD authentication.
 
 ### Protocol Buffer Header Structure
 
-The public header contains encryption metadata in Protocol Buffer format:
+Public and private headers use Protocol Buffer format:
 
 ```rust
 // Public Header (unencrypted)
@@ -97,7 +80,7 @@ The public header contains encryption metadata in Protocol Buffer format:
 
 ### Chunked Encryption Format
 
-Data is encrypted in fixed-size chunks for efficient streaming and memory usage. 
+Data is encrypted in fixed-size chunks: 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -115,23 +98,19 @@ Data is encrypted in fixed-size chunks for efficient streaming and memory usage.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Format Benefits:**
-- **Fixed-Size Chunks**: Each encrypted chunk (except the last) is exactly `chunk_size` bytes
-- **Streaming-Friendly**: No need to know total data length upfront - process chunks as they arrive
-
-**Chunk Details:**
-- **Plaintext per chunk**: `chunk_size - 16 bytes` (e.g., 64KB chunk = 65520 bytes plaintext + 16 byte auth tag)
-- **Last chunk**: May be smaller than `chunk_size` to accommodate remaining data
-
-Each chunk uses a unique nonce created by combining the base nonce with a chunk counter.
+**Format Details:**
+- Fixed-size chunks (except last): exactly `chunk_size` bytes
+- Plaintext per chunk: `chunk_size - 16 bytes` (16 bytes for auth tag)
+- Last chunk: ≤ `chunk_size` to fit remaining data
+- Unique nonce per chunk: base nonce + chunk counter
 
 ### Sec Archive Format
 
-For directories, Secify uses a custom **sec archive format** that provides minimal overhead while preserving directory structure. This lightweight streaming format is specifically designed for efficient encryption and archival without the overhead of traditional archive formats like TAR.
+Custom archive format for directories with minimal overhead.
 
 #### Archive Structure
 
-The sec archive format streams files sequentially with the following structure for each file entry:
+File entry format:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -147,18 +126,18 @@ The sec archive format streams files sequentially with the following structure f
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Archive Benefits:**
-- **Minimal Overhead**: Only 12 bytes per file + filename length 
-- **Streaming-Friendly**: Files can be processed sequentially without seeking
-- **Path Preservation**: Full relative paths maintained for directory reconstruction
-- **No Padding**: Unlike TAR, no block-size padding waste (95% overhead reduction for small files)
-- **Natural Termination**: Archive ends when encrypted data stream ends
+**Archive Details:**
+- Overhead: 12 bytes + filename length per file
+- Sequential processing, no seeking required
+- Relative paths preserved for directory reconstruction
+- No block padding
+- Archive ends when encrypted data stream ends
 
 **Directory Handling:**
-- **Recursive Processing**: All subdirectories are flattened into relative paths
-- **Path Separators**: Uses forward slashes `/` for cross-platform compatibility
-- **Metadata**: File modification times and permissions are not preserved (encryption-focused)
-- **Empty Directories**: Not explicitly stored (recreated during extraction as needed)
+- Subdirectories flattened to relative paths
+- Forward slash `/` path separators
+- File metadata not preserved
+- Empty directories recreated as needed
 
 #### Example Directory Archive
 
@@ -180,16 +159,16 @@ The sec archive would contain:
 
 ### File Integrity Protection
 
-The `.sec` format provides comprehensive integrity protection through multiple layers:
+Multi-layer integrity protection:
 
 **Per-Chunk Authentication (AEAD):**
-- Each chunk includes a 16-byte authentication tag
-- Immediate detection of chunk-level corruption or tampering
-- Prevents chosen-ciphertext attacks on individual chunks
+- 16-byte authentication tag per chunk
+- Detects chunk-level corruption or tampering
+- Prevents chosen-ciphertext attacks
 - Enables safe streaming decryption
 
 **File-Level Integrity (HMAC):**
-- 32-byte HMAC-SHA256 appended to the end of multi-chunk files only
-- Computed over the original plaintext data using the encryption key
+- 32-byte HMAC-SHA256 for multi-chunk files only
+- Computed over original plaintext using encryption key
 - Verified after successful decryption of all chunks
-- **Single-chunk files skip HMAC** - AEAD authentication provides sufficient integrity protection
+- Single-chunk files skip HMAC (AEAD sufficient)
