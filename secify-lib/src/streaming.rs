@@ -59,7 +59,7 @@ impl<W: Write> StreamingEncryptionWriter<W> {
         self.inner.write_all(&encrypted)?;
         
         // Update HMAC with encrypted chunk
-        self.hmac.update(&encrypted);
+        self.hmac.update(&data);
         
         if is_final {
             // Write final HMAC
