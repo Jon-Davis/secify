@@ -116,7 +116,7 @@ File entry format:
 ┌─────────────────────────────────────────────────────────────┐
 │                    Sec Archive Entry                        │
 ├─────────────────────────────────────────────────────────────┤
-│ Name Length      │ 4 bytes (little-endian u32)              │
+│ Name Length      │ 2 bytes (little-endian u16)              │
 ├─────────────────────────────────────────────────────────────┤
 │ File Name        │ Variable length (UTF-8 string)           │
 ├─────────────────────────────────────────────────────────────┤
@@ -127,7 +127,7 @@ File entry format:
 ```
 
 **Archive Details:**
-- Overhead: 12 bytes + filename length per file
+- Overhead: 10 bytes + filename length per file
 - Sequential processing, no seeking required
 - Relative paths preserved for directory reconstruction
 - No block padding

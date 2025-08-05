@@ -3,7 +3,7 @@
 //! This module provides a lightweight streaming archive format specifically designed
 //! for efficient encryption and archival without the overhead of traditional formats like TAR.
 //!
-//! Format: [name_len: u32][name: utf8][size: u64][data]
+//! Format: [name_len: u16][name: utf8][size: u64][data]
 
 use std::fs::{self, File};
 use std::path::Path;
@@ -12,7 +12,7 @@ use crate::error::{SecifyError, Result};
 use crate::progress::EncryptProgress;
 
 /// Custom sec archive writer for minimal overhead
-/// Format: [name_len: u32][name: utf8][size: u64][data]
+/// Format: [name_len: u16][name: utf8][size: u64][data]
 pub struct SecArchiveWriter<W: Write> {
     writer: W,
 }
@@ -25,7 +25,7 @@ impl<W: Write> SecArchiveWriter<W> {
     pub fn add_file(&mut self, path: &str, size: u64, mut reader: impl Read) -> std::io::Result<()> {
         // Write name length and name
         let name_bytes = path.as_bytes();
-        self.writer.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+        self.writer.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
         self.writer.write_all(name_bytes)?;
         
         // Write file size
@@ -54,14 +54,14 @@ impl<R: Read> SecArchiveReader<R> {
     
     pub fn next_entry(&mut self) -> std::io::Result<Option<(String, u64)>> {
         // Try to read name length
-        let mut name_len_bytes = [0u8; 4];
+        let mut name_len_bytes = [0u8; 2];
         match self.reader.read_exact(&mut name_len_bytes) {
             Ok(()) => {},
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         }
         
-        let name_len = u32::from_le_bytes(name_len_bytes) as usize;
+        let name_len = u16::from_le_bytes(name_len_bytes) as usize;
         if name_len > 4096 { // Sanity check
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Name too long"));
         }
