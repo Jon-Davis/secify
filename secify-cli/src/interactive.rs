@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use anyhow::{Result, Context, bail};
 
 use secify_lib::{EncryptionAlgorithm, Argon2Params, CompressionAlgorithm, RuntimeCompressionConfig};
+use secify_lib::crypto::{StandardKdfConfig, kdf_from_standard};
 use crate::cli::{DEFAULT_ALGORITHM, MIN_PASSWORD_LENGTH};
 use crate::progress::{encrypt_with_ui, decrypt_with_ui};
 
@@ -124,76 +125,65 @@ pub fn interactive_mode_with_params(mut argon2_params: Argon2Params) -> Result<(
     // Get Argon2 parameters (only for encryption)
     if !is_decrypt {
         println!("\nArgon2id Key Derivation Settings:");
-        println!("Current: {}MB memory, {} iterations, {} threads", 
-                 argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
+        println!("Select KDF preset:");
+        println!("1. Recommended (2GB memory, 1 iteration, 4 threads) - High security");
+        println!("2. Constrained (64MB memory, 3 iterations, 4 threads) - Resource constrained");
+        println!("3. Custom - Specify your own parameters");
         
-        let customize = prompt_user("Customize Argon2 parameters? (y/N): ")?;
-        if customize.to_lowercase() == "y" || customize.to_lowercase() == "yes" {
-            // Memory cost
-            loop {
-                let input = prompt_user(&format!("Memory cost in MB (8-2048, current: {}): ", argon2_params.memory_mb))?;
-                if input.is_empty() {
-                    break; // Keep current value
-                }
-                match input.parse::<u32>() {
-                    Ok(memory_mb) => {
-                        match Argon2Params::new(memory_mb, argon2_params.time_cost, argon2_params.parallelism) {
-                            Ok(new_params) => {
-                                argon2_params = new_params;
-                                break;
-                            }
-                            Err(e) => println!("Invalid memory cost: {e}"),
-                        }
-                    }
-                    Err(_) => println!("Invalid number. Please enter a value between 8 and 2048."),
-                }
+        let kdf_choice = loop {
+            let choice = prompt_user("Enter choice (1, 2, or 3, default is 1): ")?;
+            match choice.trim() {
+                "" | "1" => break StandardKdfConfig::Argon2idRecommended,
+                "2" => break StandardKdfConfig::Argon2idConstrained,
+                "3" => break StandardKdfConfig::UnknownKdf, // Custom
+                _ => println!("Invalid choice. Please enter 1, 2, or 3."),
             }
-            
-            // Time cost
-            loop {
-                let input = prompt_user(&format!("Time cost/iterations (1-100, current: {}): ", argon2_params.time_cost))?;
-                if input.is_empty() {
-                    break; // Keep current value
-                }
-                match input.parse::<u32>() {
-                    Ok(time_cost) => {
-                        match Argon2Params::new(argon2_params.memory_mb, time_cost, argon2_params.parallelism) {
-                            Ok(new_params) => {
-                                argon2_params = new_params;
-                                break;
-                            }
-                            Err(e) => println!("Invalid time cost: {e}"),
-                        }
+        };
+        
+        argon2_params = match kdf_choice {
+            StandardKdfConfig::Argon2idRecommended => {
+                println!("Using recommended preset: 2GB memory, 1 iteration, 4 threads");
+                kdf_from_standard(StandardKdfConfig::Argon2idRecommended)
+                    .map_err(|e| anyhow::anyhow!("Failed to create recommended preset: {}", e))?
+            },
+            StandardKdfConfig::Argon2idConstrained => {
+                println!("Using constrained preset: 64MB memory, 3 iterations, 4 threads");
+                kdf_from_standard(StandardKdfConfig::Argon2idConstrained)
+                    .map_err(|e| anyhow::anyhow!("Failed to create constrained preset: {}", e))?
+            },
+            StandardKdfConfig::UnknownKdf => {
+                // Custom parameters
+                println!("Current custom settings: {}MB memory, {} iterations, {} threads", 
+                         argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
+                
+                let customize = prompt_user("Customize these parameters? (y/N): ")?;
+                if customize.to_lowercase() == "y" || customize.to_lowercase() == "yes" {
+                    println!("Memory size in MB (current: {}): ", argon2_params.memory_mb);
+                    let memory_input = prompt_user("")?;
+                    if !memory_input.trim().is_empty() {
+                        argon2_params.memory_mb = memory_input.trim().parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid memory size"))?;
                     }
-                    Err(_) => println!("Invalid number. Please enter a value between 1 and 100."),
-                }
-            }
-            
-            // Parallelism
-            loop {
-                let input = prompt_user(&format!("Parallelism/threads (1-16, current: {}): ", argon2_params.parallelism))?;
-                if input.is_empty() {
-                    break; // Keep current value
-                }
-                match input.parse::<u32>() {
-                    Ok(parallelism) => {
-                        match Argon2Params::new(argon2_params.memory_mb, argon2_params.time_cost, parallelism) {
-                            Ok(new_params) => {
-                                argon2_params = new_params;
-                                break;
-                            }
-                            Err(e) => println!("Invalid parallelism: {e}"),
-                        }
+                    
+                    println!("Number of iterations (current: {}): ", argon2_params.time_cost);
+                    let time_input = prompt_user("")?;
+                    if !time_input.trim().is_empty() {
+                        argon2_params.time_cost = time_input.trim().parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid time cost"))?;
                     }
-                    Err(_) => println!("Invalid number. Please enter a value between 1 and 16."),
+                    
+                    println!("Number of threads (current: {}): ", argon2_params.parallelism);
+                    let parallelism_input = prompt_user("")?;
+                    if !parallelism_input.trim().is_empty() {
+                        argon2_params.parallelism = parallelism_input.trim().parse()
+                            .map_err(|_| anyhow::anyhow!("Invalid parallelism"))?;
+                    }
                 }
+                argon2_params
             }
-            
-            println!("Final Argon2id settings: {}MB memory, {} iterations, {} threads", 
-                     argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
-        }
+        };
     }
-    
+
     // Get compression settings (only for encryption)
     let compression_config = if !is_decrypt {
         println!("\nCompression Settings:");

@@ -1,5 +1,6 @@
 use clap::Parser;
 use secify_lib::{EncryptionAlgorithm, CompressionAlgorithm, parse_algorithm};
+use secify_lib::crypto::StandardKdfConfig;
 
 fn parse_algorithm_for_clap(s: &str) -> Result<EncryptionAlgorithm, String> {
     parse_algorithm(s).map_err(|e| e.to_string())
@@ -22,6 +23,15 @@ fn parse_compression_level(s: &str) -> Result<i32, String> {
     }
 }
 
+fn parse_kdf_preset(s: &str) -> Result<StandardKdfConfig, String> {
+    match s.to_lowercase().as_str() {
+        "recommended" | "argon2id_recommended" => Ok(StandardKdfConfig::Argon2idRecommended),
+        "constrained" | "argon2id_constrained" => Ok(StandardKdfConfig::Argon2idConstrained),
+        "custom" => Ok(StandardKdfConfig::UnknownKdf), // Special marker for custom
+        _ => Err(format!("Invalid KDF preset '{s}'. Valid options: recommended, constrained, custom")),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "secify")]
 #[command(about = "A CLI tool for encrypting and decrypting files and directories using industry-standard cryptography")]
@@ -41,14 +51,17 @@ pub struct Cli {
     /// Compression level (1-22 for zstd, default: 3). Higher values are slower but compress better.
     #[arg(long, value_parser = parse_compression_level, default_value = "3", help = "Compression level (1-22 for zstd, default: 3). Higher values compress better but slower")]
     pub compression_level: i32,
-    /// Argon2 memory cost in MB (8-2048, default: 128). Higher values are more secure but slower.
-    #[arg(long, default_value = "128", help = "Argon2 memory cost in MB (8-2048, default: 128)")]
+    /// Argon2 KDF preset (recommended, constrained, custom, default: recommended)
+    #[arg(long, value_parser = parse_kdf_preset, default_value = "recommended", help = "Argon2 KDF preset: recommended (2GB, 1 iter, 4 threads), constrained (64MB, 3 iters, 4 threads), or custom")]
+    pub kdf_preset: StandardKdfConfig,
+    /// Argon2 memory cost in MB (8-2048, default: 128). Only used when kdf-preset=custom.
+    #[arg(long, default_value = "128", help = "Argon2 memory cost in MB (8-2048, default: 128). Only used when kdf-preset=custom")]
     pub memory_mb: u32,
-    /// Argon2 time cost/iterations (1-100, default: 8). Higher values are more secure but slower.
-    #[arg(long, default_value = "8", help = "Argon2 time cost/iterations (1-100, default: 8)")]
+    /// Argon2 time cost/iterations (1-100, default: 8). Only used when kdf-preset=custom.
+    #[arg(long, default_value = "8", help = "Argon2 time cost/iterations (1-100, default: 8). Only used when kdf-preset=custom")]
     pub time_cost: u32,
-    /// Argon2 parallelism/threads (1-16, default: 4). Should match your CPU cores.
-    #[arg(long, default_value = "4", help = "Argon2 parallelism/threads (1-16, default: 4)")]
+    /// Argon2 parallelism/threads (1-16, default: 4). Only used when kdf-preset=custom.
+    #[arg(long, default_value = "4", help = "Argon2 parallelism/threads (1-16, default: 4). Only used when kdf-preset=custom")]
     pub parallelism: u32,
 }
 

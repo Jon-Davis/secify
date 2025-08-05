@@ -595,15 +595,12 @@ pub fn decrypt_core(
     validate_header(&header)?;
     
     // Parse the encryption algorithm from header
-    let algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
+    let algorithm_field = header.encryption_algorithm.as_ref()
+        .ok_or_else(|| SecifyError::invalid_format("Missing encryption algorithm"))?;
+    let algorithm = algorithm_from_protobuf(algorithm_field)?;
     
-    // Extract Argon2 parameters from header
-    let kdf = header.kdf.as_ref().ok_or_else(|| SecifyError::invalid_format("Missing KDF configuration"))?;
-    let argon2_params = Argon2Params::new(
-        kdf.memory_cost / 1024, // Convert KB back to MB
-        kdf.time_cost,
-        kdf.parallelism,
-    )?;
+    // Extract Argon2 parameters from KDF config
+    let argon2_params = extract_argon2_params(&header)?;
     
     // Derive decryption key from password and salt from header
     let key = derive_key(password, &header.salt, &argon2_params)?;
@@ -647,13 +644,12 @@ pub fn decrypt_core(
     // Create encryption info for progress callback (now with payload header info)
     let encryption_info = EncryptionInfo {
         version: header.version,
-        algorithm: header.encryption_algorithm.clone(),
+        algorithm: algorithm.to_string().to_string(),
         compression: payload_header.compression.as_ref().map(|c| c.algorithm.clone()),
-        kdf_info: format!("{} ({}MB, {} iterations, {} threads)", 
-                         kdf.algorithm, 
-                         kdf.memory_cost / 1024,
-                         kdf.time_cost,
-                         kdf.parallelism),
+        kdf_info: format!("Argon2id ({}MB, {} iterations, {} threads)", 
+                         argon2_params.memory_mb, 
+                         argon2_params.time_cost,
+                         argon2_params.parallelism),
         chunk_size: header.chunk_size,
     };
     
@@ -770,8 +766,10 @@ pub fn decrypt_core(
     let mut protobuf_skip = vec![0u8; header_length];
     verification_reader.read_exact(&mut protobuf_skip)?;
     
-    // Create decryption reader for HMAC verification
-    let verification_algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
+    // Create decryption reader for HMAC verification  
+    let verification_algorithm_field = header.encryption_algorithm.as_ref()
+        .ok_or_else(|| SecifyError::invalid_format("Missing encryption algorithm"))?;
+    let verification_algorithm = algorithm_from_protobuf(verification_algorithm_field)?;
     let mut hmac_verification_reader = StreamingDecryptionReader::new(
         verification_reader,
         verification_algorithm,

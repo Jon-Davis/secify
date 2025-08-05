@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use clap::Parser;
 
 use secify_lib::{Argon2Params, RuntimeCompressionConfig, CompressionAlgorithm};
+use secify_lib::crypto::{StandardKdfConfig, kdf_from_standard};
 
 mod cli;
 mod progress;
@@ -14,8 +15,21 @@ use progress::{encrypt_with_ui, decrypt_with_ui};
 fn main() -> Result<()> {
     let cli = Cli::parse();
     
-    // Create Argon2 parameters from CLI arguments
-    let argon2_params = Argon2Params::new(cli.memory_mb, cli.time_cost, cli.parallelism)?;
+    // Create Argon2 parameters based on preset or custom values
+    let argon2_params = match cli.kdf_preset {
+        StandardKdfConfig::Argon2idRecommended => {
+            kdf_from_standard(StandardKdfConfig::Argon2idRecommended)
+                .map_err(|e| anyhow::anyhow!("Failed to create recommended KDF preset: {}", e))?
+        },
+        StandardKdfConfig::Argon2idConstrained => {
+            kdf_from_standard(StandardKdfConfig::Argon2idConstrained)
+                .map_err(|e| anyhow::anyhow!("Failed to create constrained KDF preset: {}", e))?
+        },
+        StandardKdfConfig::UnknownKdf => {
+            // Custom parameters
+            Argon2Params::new(cli.memory_mb, cli.time_cost, cli.parallelism)?
+        },
+    };
     
     // Create compression config if compression is enabled
     let compression_config = if matches!(cli.compression, CompressionAlgorithm::None) {
@@ -67,8 +81,15 @@ fn main() -> Result<()> {
                 
                 println!("Using chunked encryption: {}KB chunks for optimal memory usage", 
                          secify_lib::DEFAULT_CHUNK_SIZE / 1024);
-                println!("Using Argon2id parameters: {}MB memory, {} iterations, {} threads", 
-                         argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism);
+                
+                // Show KDF preset info
+                let kdf_info = match cli.kdf_preset {
+                    StandardKdfConfig::Argon2idRecommended => "recommended preset (2GB, 1 iter, 4 threads)".to_string(),
+                    StandardKdfConfig::Argon2idConstrained => "constrained preset (64MB, 3 iters, 4 threads)".to_string(),
+                    StandardKdfConfig::UnknownKdf => format!("custom ({}MB, {} iters, {} threads)", 
+                                                            argon2_params.memory_mb, argon2_params.time_cost, argon2_params.parallelism),
+                };
+                println!("Using Argon2id {}", kdf_info);
                 
                 // Create output path
                 let clean_path = file.trim_end_matches('/').trim_end_matches('\\');

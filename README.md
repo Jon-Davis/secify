@@ -18,11 +18,11 @@ This is just a personal project, to explore different encryption methods.
 - **ChaCha20-Poly1305**: Faster on mobile and older processors
 
 ### Argon2id Key Derivation
-Secify uses Argon2id for key derivation with customizable parameters:
+Secify uses Argon2id for key derivation with three preset configurations:
 
-- **Memory Cost** (8-2048 MB, default: 128): Memory usage during key derivation
-- **Time Cost** (1-100 iterations, default: 8): Number of iterations
-- **Parallelism** (1-16 threads, default: 4): Number of parallel threads
+- **argon2id_recommended** (default): 2GB memory, 1 iteration, 4 threads - High security for modern systems
+- **argon2id_constrained**: 64MB memory, 3 iterations, 4 threads - Resource-constrained environments
+- **argon2id_custom**: Fully customizable parameters (8-2048 MB memory, 1-100 iterations, 1-16 threads)
 
 ## File Format: Securely Encrypted Container (.sec)
 
@@ -78,13 +78,8 @@ The public header contains encryption metadata in Protocol Buffer format:
 {
   "version": 0,                           // File format version
   "encryption_algorithm": "AES-256-GCM",  // Encryption method
-  "kdf": {                                // Key derivation function
-    "algorithm": "Argon2id",
-    "version": "0x13",                    // Argon2 version 1.3
-    "memory_cost": 131072,                // 128 MB in KB
-    "time_cost": 8,                       // 8 iterations
-    "parallelism": 4,                     // 4 threads
-    "output_length": 32                   // 32-byte key
+  "kdf_config": {                         // Key derivation configuration
+    "standard_kdf": "ARGON2ID_RECOMMENDED" // Preset (2GB, 1 iter, 4 threads)
   },
   "salt": [32 bytes],                     // Random salt for key derivation
   "nonce": [8/16 bytes],                  // Base nonce for chunked encryption
@@ -96,7 +91,7 @@ The public header contains encryption metadata in Protocol Buffer format:
   "compression": {                        // Optional compression configuration
     "algorithm": "zstd"                   // Compression algorithm (if used)
   },
-  "archive": "sec"                        // Optional: Archive format (only present for directories)
+  "archive": "sec"                        // Optional: Archive format
 }
 ```
 

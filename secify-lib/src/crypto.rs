@@ -157,6 +157,88 @@ pub struct RuntimeCompressionConfig {
 // Include the generated protobuf structs
 include!(concat!(env!("OUT_DIR"), "/secify.rs"));
 
+/// Convert our internal EncryptionAlgorithm to protobuf format
+fn algorithm_to_protobuf(algorithm: &EncryptionAlgorithm) -> encryption_header::EncryptionAlgorithm {
+    match algorithm {
+        EncryptionAlgorithm::Aes256Gcm => {
+            encryption_header::EncryptionAlgorithm::Standard(StandardAlgorithm::Aes256Gcm as i32)
+        },
+        EncryptionAlgorithm::ChaCha20Poly1305 => {
+            encryption_header::EncryptionAlgorithm::Standard(StandardAlgorithm::Chacha20Poly1305 as i32)
+        },
+        EncryptionAlgorithm::XChaCha20Poly1305 => {
+            encryption_header::EncryptionAlgorithm::Standard(StandardAlgorithm::Xchacha20Poly1305 as i32)
+        },
+    }
+}
+
+/// Convert protobuf format to our internal EncryptionAlgorithm
+pub fn algorithm_from_protobuf(alg: &encryption_header::EncryptionAlgorithm) -> Result<EncryptionAlgorithm> {
+    match alg {
+        encryption_header::EncryptionAlgorithm::Standard(standard) => {
+            match StandardAlgorithm::try_from(*standard) {
+                Ok(StandardAlgorithm::Aes256Gcm) => Ok(EncryptionAlgorithm::Aes256Gcm),
+                Ok(StandardAlgorithm::Chacha20Poly1305) => Ok(EncryptionAlgorithm::ChaCha20Poly1305),
+                Ok(StandardAlgorithm::Xchacha20Poly1305) => Ok(EncryptionAlgorithm::XChaCha20Poly1305),
+                Ok(StandardAlgorithm::Unknown) => Err(SecifyError::invalid_config("Unknown algorithm".to_string())),
+                Err(_) => Err(SecifyError::invalid_config(format!("Invalid standard algorithm: {}", standard))),
+            }
+        },
+        encryption_header::EncryptionAlgorithm::Custom(name) => {
+            // Try to parse custom algorithm names for forward compatibility
+            EncryptionAlgorithm::from_string(name)
+        },
+    }
+}
+
+/// Convert standard KDF config to Argon2 parameters
+pub fn kdf_from_standard(standard: StandardKdfConfig) -> Result<Argon2Params> {
+    match standard {
+        StandardKdfConfig::Argon2idRecommended => {
+            // High security: 2GB, 1 iteration, 4 threads
+            Argon2Params::new(2048, 1, 4)
+        },
+        StandardKdfConfig::Argon2idConstrained => {
+            // Resource constrained: 64MB, 3 iterations, 4 threads
+            Argon2Params::new(64, 3, 4)
+        },
+        StandardKdfConfig::UnknownKdf => {
+            Err(SecifyError::invalid_config("Unknown KDF preset".to_string()))
+        }
+    }
+}
+
+/// Convert Argon2 parameters to standard KDF config if it matches a preset
+pub fn kdf_to_standard(params: &Argon2Params) -> Option<StandardKdfConfig> {
+    match (params.memory_mb, params.time_cost, params.parallelism) {
+        (2048, 1, 4) => Some(StandardKdfConfig::Argon2idRecommended),
+        (64, 3, 4) => Some(StandardKdfConfig::Argon2idConstrained),
+        _ => None,
+    }
+}
+
+/// Extract Argon2 parameters from the oneof KDF config
+pub fn extract_argon2_params(header: &EncryptionHeader) -> Result<Argon2Params> {
+    match &header.kdf_config {
+        Some(encryption_header::KdfConfig::StandardKdf(standard)) => {
+            match StandardKdfConfig::try_from(*standard) {
+                Ok(preset) => kdf_from_standard(preset),
+                Err(_) => Err(SecifyError::invalid_config(format!("Invalid standard KDF: {}", standard))),
+            }
+        },
+        Some(encryption_header::KdfConfig::CustomKdf(kdf)) => {
+            if kdf.algorithm != "Argon2id" {
+                return Err(SecifyError::invalid_format(format!("Unsupported key derivation function: {}", kdf.algorithm)));
+            }
+            
+            // Convert from KB to MB
+            let memory_mb = kdf.memory_cost / 1024;
+            Argon2Params::new(memory_mb, kdf.time_cost, kdf.parallelism)
+        },
+        None => Err(SecifyError::invalid_format("Missing KDF configuration".to_string())),
+    }
+}
+
 pub fn generate_secure_random_bytes(buffer: &mut [u8]) -> Result<()> {
     // Use cryptographically secure random number generator
     // OsRng provides entropy from the operating system's CSPRNG
@@ -354,19 +436,26 @@ pub fn decrypt_data_chunked(algorithm: &EncryptionAlgorithm, key: &[u8; KEY_LENG
 }
 
 pub fn create_encryption_header(salt: &[u8], nonce: &[u8], algorithm: &EncryptionAlgorithm, argon2_params: &Argon2Params, chunk_size: u32) -> EncryptionHeader {
-    let kdf = KeyDerivationConfig {
-        algorithm: "Argon2id".to_owned(),
-        version: "0x13".to_owned(),
-        memory_cost: argon2_params.memory_kb(),
-        time_cost: argon2_params.time_cost,
-        parallelism: argon2_params.parallelism,
-        output_length: KEY_LENGTH as u32,
+    // Try to use a standard preset if the parameters match
+    let kdf_config = if let Some(standard) = kdf_to_standard(argon2_params) {
+        Some(encryption_header::KdfConfig::StandardKdf(standard as i32))
+    } else {
+        // Use custom KDF config
+        let kdf = KeyDerivationConfig {
+            algorithm: "Argon2id".to_owned(),
+            version: "0x13".to_owned(),
+            memory_cost: argon2_params.memory_kb(),
+            time_cost: argon2_params.time_cost,
+            parallelism: argon2_params.parallelism,
+            output_length: KEY_LENGTH as u32,
+        };
+        Some(encryption_header::KdfConfig::CustomKdf(kdf))
     };
     
     EncryptionHeader {
         version: FILE_FORMAT_VERSION,
-        encryption_algorithm: algorithm.to_string().to_owned(),
-        kdf: Some(kdf),
+        encryption_algorithm: Some(algorithm_to_protobuf(algorithm)),
+        kdf_config,
         salt: salt.to_vec(),
         nonce: nonce.to_vec(),
         chunk_size,
@@ -424,13 +513,12 @@ pub fn validate_header(header: &EncryptionHeader) -> Result<()> {
     }
     
     // Validate encryption algorithm (parse to ensure it's supported)
-    let algorithm = EncryptionAlgorithm::from_string(&header.encryption_algorithm)?;
+    let algorithm_field = header.encryption_algorithm.as_ref()
+        .ok_or_else(|| SecifyError::invalid_format("Missing encryption algorithm"))?;
+    let algorithm = algorithm_from_protobuf(algorithm_field)?;
     
-    // Validate KDF
-    let kdf = header.kdf.as_ref().ok_or_else(|| SecifyError::invalid_format("Missing KDF configuration"))?;
-    if kdf.algorithm != "Argon2id" {
-        return Err(SecifyError::invalid_format(format!("Unsupported key derivation function: {}", kdf.algorithm)));
-    }
+    // Validate KDF configuration and extract parameters
+    let _argon2_params = extract_argon2_params(header)?;
     
     // Validate salt and nonce lengths
     if header.salt.len() != SALT_LENGTH {
@@ -711,12 +799,17 @@ mod tests {
         // Test file header (no archive field for single files)
         let header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         assert_eq!(header.version, FILE_FORMAT_VERSION);
-        assert_eq!(header.encryption_algorithm, "XChaCha20-Poly1305");
-        let kdf = header.kdf.as_ref().expect("KDF should be present");
-        assert_eq!(kdf.algorithm, "Argon2id");
-        assert_eq!(kdf.memory_cost, params.memory_kb());
-        assert_eq!(kdf.time_cost, params.time_cost);
-        assert_eq!(kdf.parallelism, params.parallelism);
+        
+        // Test the algorithm conversion roundtrip
+        let algorithm_field = header.encryption_algorithm.as_ref().expect("Algorithm should be present");
+        let parsed_algorithm = algorithm_from_protobuf(algorithm_field).expect("Should parse successfully");
+        assert_eq!(parsed_algorithm.to_string(), "XChaCha20-Poly1305");
+        
+        // Test the KDF extraction roundtrip
+        let extracted_params = extract_argon2_params(&header).expect("Should extract KDF params");
+        assert_eq!(extracted_params.memory_mb, params.memory_mb);
+        assert_eq!(extracted_params.time_cost, params.time_cost);
+        assert_eq!(extracted_params.parallelism, params.parallelism);
         assert_eq!(header.salt, salt.to_vec());
         assert_eq!(header.nonce, base_nonce);
         assert_eq!(header.chunk_size, DEFAULT_CHUNK_SIZE as u32);
@@ -750,8 +843,14 @@ mod tests {
         // Compare fields
         assert_eq!(original_header.version, deserialized_header.version);
         assert_eq!(original_header.encryption_algorithm, deserialized_header.encryption_algorithm);
-        assert_eq!(original_header.kdf.as_ref().unwrap().algorithm, deserialized_header.kdf.as_ref().unwrap().algorithm);
-        assert_eq!(original_header.kdf.as_ref().unwrap().memory_cost, deserialized_header.kdf.as_ref().unwrap().memory_cost);
+        
+        // Compare KDF parameters by extracting them
+        let original_params = extract_argon2_params(&original_header).unwrap();
+        let deserialized_params = extract_argon2_params(&deserialized_header).unwrap();
+        assert_eq!(original_params.memory_mb, deserialized_params.memory_mb);
+        assert_eq!(original_params.time_cost, deserialized_params.time_cost);
+        assert_eq!(original_params.parallelism, deserialized_params.parallelism);
+        
         assert_eq!(original_header.salt, deserialized_header.salt);
         assert_eq!(original_header.nonce, deserialized_header.nonce);
         assert_eq!(original_header.chunk_size, deserialized_header.chunk_size);
@@ -790,8 +889,8 @@ mod tests {
         let params = create_fast_test_params();
         let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
-        // Set invalid algorithm
-        header.encryption_algorithm = "Invalid-Algorithm".to_string();
+        // Set invalid algorithm using the custom variant
+        header.encryption_algorithm = Some(encryption_header::EncryptionAlgorithm::Custom("Invalid-Algorithm".to_string()));
         assert!(validate_header(&header).is_err());
     }
 
@@ -803,10 +902,16 @@ mod tests {
         let params = create_fast_test_params();
         let mut header = create_encryption_header(&salt, &base_nonce, &algorithm, &params, DEFAULT_CHUNK_SIZE as u32);
         
-        // Set invalid KDF
-        if let Some(ref mut kdf) = header.kdf {
-            kdf.algorithm = "PBKDF2".to_string();
-        }
+        // Set invalid KDF - create a custom KDF with unsupported algorithm
+        let invalid_kdf = KeyDerivationConfig {
+            algorithm: "PBKDF2".to_string(),
+            version: "1.0".to_string(),
+            memory_cost: 1024,
+            time_cost: 1,
+            parallelism: 1,
+            output_length: 32,
+        };
+        header.kdf_config = Some(encryption_header::KdfConfig::CustomKdf(invalid_kdf));
         assert!(validate_header(&header).is_err());
     }
 
@@ -1230,7 +1335,11 @@ mod tests {
         
         // Verify basic header fields are correct
         assert_eq!(public_header.version, FILE_FORMAT_VERSION);
-        assert_eq!(public_header.encryption_algorithm, algorithm.to_string());
+        
+        // Test the algorithm conversion
+        let algorithm_field = public_header.encryption_algorithm.as_ref().expect("Algorithm should be present");
+        let parsed_algorithm = algorithm_from_protobuf(algorithm_field).expect("Should parse successfully");
+        assert_eq!(parsed_algorithm.to_string(), algorithm.to_string());
     }
 
     #[test]

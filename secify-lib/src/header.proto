@@ -2,14 +2,40 @@ syntax = "proto3";
 
 package secify;
 
+// Known encryption algorithms
+enum StandardAlgorithm {
+  UNKNOWN = 0;
+  AES_256_GCM = 1;
+  CHACHA20_POLY1305 = 2;
+  XCHACHA20_POLY1305 = 3;
+}
+
+// Standard Argon2 presets
+enum StandardKdfConfig {
+  UNKNOWN_KDF = 0;
+  ARGON2ID_RECOMMENDED = 1;  // 2GB, 1 iter, 4 threads - high security
+  ARGON2ID_CONSTRAINED = 2;  // 64MB, 3 iters, 4 threads - resource constrained
+}
+
 // Main header - contains minimal info needed to start decryption
 message EncryptionHeader {
   uint32 version = 1;
-  string encryption_algorithm = 2;
-  KeyDerivationConfig kdf = 3;
-  bytes salt = 4;
-  bytes nonce = 5;
-  uint32 chunk_size = 6;
+  
+  // Sum type: either a standard algorithm OR a custom string
+  oneof encryption_algorithm {
+    StandardAlgorithm standard = 2;
+    string custom = 3;
+  }
+  
+  // Sum type: either a standard KDF preset OR custom config
+  oneof kdf_config {
+    StandardKdfConfig standard_kdf = 4;
+    KeyDerivationConfig custom_kdf = 5;
+  }
+  
+  bytes salt = 6;
+  bytes nonce = 7;
+  uint32 chunk_size = 8;
 }
 
 // Payload header - encrypted as part of the data stream
