@@ -442,9 +442,16 @@ pub fn encrypt_core(
         base_nonce,
     )?;
 
-    // Write encrypted payload header as first part of encrypted stream
-    encryption_writer.write_all(&(payload_header_data.len() as u16).to_le_bytes())?;
-    encryption_writer.write_all(&payload_header_data)?;
+    // Write encrypted payload header as first part of encrypted stream only if needed
+    // If no compression and no archive, write length 0 and skip the payload header entirely
+    let has_payload_header = compression.is_some() || archive_format.is_some();
+    if has_payload_header {
+        encryption_writer.write_all(&(payload_header_data.len() as u16).to_le_bytes())?;
+        encryption_writer.write_all(&payload_header_data)?;
+    } else {
+        // Write zero length to indicate no private header
+        encryption_writer.write_all(&0u16.to_le_bytes())?;
+    }
 
     event_callback(SecifyEvent::EncryptProgress(EncryptProgress::EncryptionStarted));
 
@@ -616,21 +623,28 @@ pub fn decrypt_core(
         ciphertext_size,
     )?;
     
-    // Read encrypted payload header (first part of encrypted stream)
+    // Read encrypted payload header (first part of encrypted stream) if present
     let mut payload_header_len_bytes = [0u8; 2];
     decryption_reader.read_exact(&mut payload_header_len_bytes)
         .map_err(|e| SecifyError::invalid_format(format!("Failed to read payload header length: {}", e)))?;
     let payload_header_len = u16::from_le_bytes(payload_header_len_bytes) as usize;
     
-    if payload_header_len > MAX_HEADER_SIZE {
-        return Err(SecifyError::invalid_format(format!("Payload header too large: {} bytes", payload_header_len)));
-    }
+    // Handle case where no private header exists (length = 0)
+    let payload_header = if payload_header_len == 0 {
+        // No private header - create empty payload header with no compression or archive
+        create_payload_header(None, None)
+    } else {
+        if payload_header_len > MAX_HEADER_SIZE {
+            return Err(SecifyError::invalid_format(format!("Payload header too large: {} bytes", payload_header_len)));
+        }
+        
+        let mut payload_header_data = vec![0u8; payload_header_len];
+        decryption_reader.read_exact(&mut payload_header_data)
+            .map_err(|e| SecifyError::invalid_format(format!("Failed to read payload header data: {}", e)))?;
+        
+        deserialize_payload_header_from_protobuf(&payload_header_data)?
+    };
     
-    let mut payload_header_data = vec![0u8; payload_header_len];
-    decryption_reader.read_exact(&mut payload_header_data)
-        .map_err(|e| SecifyError::invalid_format(format!("Failed to read payload header data: {}", e)))?;
-    
-    let payload_header = deserialize_payload_header_from_protobuf(&payload_header_data)?;
     validate_payload_header(&payload_header)?;
     
     // Create encryption info for progress callback (now with payload header info)
