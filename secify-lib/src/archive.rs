@@ -62,7 +62,7 @@ impl<R: Read> SecArchiveReader<R> {
         }
         
         let name_len = u16::from_le_bytes(name_len_bytes) as usize;
-        if name_len > 4096 { // Sanity check
+        if name_len > u16::MAX as usize { 
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Name too long"));
         }
         

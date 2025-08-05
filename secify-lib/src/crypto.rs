@@ -15,7 +15,6 @@ use prost::Message;
 pub const SALT_LENGTH: usize = 32;
 pub const KEY_LENGTH: usize = 32;
 pub const FILE_FORMAT_VERSION: u32 = 0;
-pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB limit to prevent OOM
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks for streaming encryption
 
 // Default Argon2 parameters
@@ -42,24 +41,15 @@ impl Default for Argon2Params {
 
 impl Argon2Params {
     pub fn new(memory_mb: u32, time_cost: u32, parallelism: u32) -> Result<Self> {
-        // Validate parameters
-        if memory_mb < 8 {
-            return Err(SecifyError::invalid_config("Memory cost must be at least 8 MB"));
-        }
-        if memory_mb > 2048 {
-            return Err(SecifyError::invalid_config("Memory cost cannot exceed 2048 MB (2GB)"));
+        // Validate parameters: enforce minimal sensible values only
+        if memory_mb < 1 {
+            return Err(SecifyError::invalid_config("Memory cost must be at least 1 MB"));
         }
         if time_cost < 1 {
             return Err(SecifyError::invalid_config("Time cost must be at least 1 iteration"));
         }
-        if time_cost > 100 {
-            return Err(SecifyError::invalid_config("Time cost cannot exceed 100 iterations"));
-        }
         if parallelism < 1 {
             return Err(SecifyError::invalid_config("Parallelism must be at least 1 thread"));
-        }
-        if parallelism > 16 {
-            return Err(SecifyError::invalid_config("Parallelism cannot exceed 16 threads"));
         }
         
         Ok(Self {
