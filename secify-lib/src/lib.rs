@@ -115,7 +115,7 @@ mod tests {
         fs::write(&input_file, b"Test content").unwrap();
         
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
-        let params = Argon2Params::default();
+        let params = Argon2Params::new(8, 1, 1).unwrap(); // Fast parameters for testing
         
         // Test encryption
         encrypt_core(

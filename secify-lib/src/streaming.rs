@@ -51,7 +51,7 @@ impl<W: Write> StreamingEncryptionWriter<W> {
         })
     }
 
-    fn encrypt_chunk(&mut self, data: &[u8], is_final: bool) -> Result<()> {
+    fn encrypt_chunk(&mut self, data: &[u8]) -> Result<()> {
         let nonce = create_streaming_chunk_nonce(&self.algorithm, &self.base_nonce, self.chunk_counter)?;
         let encrypted = encrypt_data(&self.algorithm, &self.key, &nonce, data)?;
         
@@ -61,12 +61,6 @@ impl<W: Write> StreamingEncryptionWriter<W> {
         // Update HMAC with encrypted chunk
         self.hmac.update(&data);
         
-        if is_final {
-            // Write final HMAC
-            let hmac_result = self.hmac.clone().finalize().into_bytes();
-            self.inner.write_all(&hmac_result)?;
-        }
-        
         self.chunk_counter += 1;
         Ok(())
     }
@@ -75,12 +69,11 @@ impl<W: Write> StreamingEncryptionWriter<W> {
         // Encrypt any remaining data in buffer
         if !self.buffer.is_empty() {
             let data = std::mem::take(&mut self.buffer);
-            self.encrypt_chunk(&data, true)?;
-        } else {
-            // Even if buffer is empty, we need to write the HMAC
-            let hmac_result = self.hmac.clone().finalize().into_bytes();
+            self.encrypt_chunk(&data)?;
+        } 
+
+        let hmac_result = self.hmac.finalize().into_bytes();
             self.inner.write_all(&hmac_result)?;
-        }
         
         Ok(self.inner)
     }
@@ -101,7 +94,7 @@ impl<W: Write> Write for StreamingEncryptionWriter<W> {
             
             if self.buffer.len() == self.chunk_size {
                 let data = std::mem::take(&mut self.buffer);
-                self.encrypt_chunk(&data, false)
+                self.encrypt_chunk(&data)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             }
         }
@@ -180,13 +173,13 @@ impl<R: Read> StreamingDecryptionReader<R> {
         
         chunk_data.truncate(bytes_read);
         
-        // Update HMAC with encrypted chunk before decryption
-        self.hmac.update(&chunk_data);
         
         // Decrypt chunk
         let nonce = create_streaming_chunk_nonce(&self.algorithm, &self.base_nonce, self.chunk_counter)?;
         let decrypted = decrypt_data(&self.algorithm, &self.key, &nonce, &chunk_data)?;
         
+        // Update HMAC with decrypted (plaintext) chunk
+        self.hmac.update(&decrypted);
         self.current_chunk = decrypted;
         self.chunk_pos = 0;
         self.chunk_counter += 1;
