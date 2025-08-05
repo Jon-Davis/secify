@@ -7,7 +7,7 @@ Secify is a secure file encryption tool. It encrypts files or directories into `
 ## Features
 
 - Encryption algorithms: AES-256-GCM, ChaCha20-Poly1305, XChaCha20-Poly1305
-- Optional compression (zstd level 3)
+- Optional compression (zstd)
 - Directory support with custom archive format
 - Streaming architecture: constant memory usage, no temp files
 - Argon2id key derivation with recommended, constrained, and custom presets
@@ -29,21 +29,21 @@ Streaming pipeline: Read → [Archive] → Compress → Encrypt → Write
 The `.sec` format is a binary container with the following structure:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    .sec File Format                         │
-├─────────────────────────────────────────────────────────────┤
-│ Public Header Len│ 2 bytes (little-endian u16)              │
-├─────────────────────────────────────────────────────────────┤
-│ Public Header    │ Variable length (encryption info only)   │
-├─────────────────────────────────────────────────────────────┤
-│ Private Header Len│ 2 bytes (little-endian u16)             │
-├─────────────────────────────────────────────────────────────┤
-│ Private Header   │ Variable length (encrypted metadata)     │
-├─────────────────────────────────────────────────────────────┤
-│ Encrypted Data   │ Variable length (optionally compressed)  │
-├─────────────────────────────────────────────────────────────┤
-│ File HMAC        │ 32 bytes (HMAC-SHA256, multi-chunk only) │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    .sec File Format                          │
+├──────────────────────────────────────────────────────────────┤
+│ Public Header Len │ 2 bytes (little-endian u16)              │
+├──────────────────────────────────────────────────────────────┤
+│ Public Header     │ Variable length (encryption info only)   │
+├──────────────────────────────────────────────────────────────┤
+│ Private Header Len│ 2 bytes (little-endian u16)              │
+├──────────────────────────────────────────────────────────────┤
+│ Private Header    │ Variable length (encrypted metadata)     │
+├──────────────────────────────────────────────────────────────┤
+│ Encrypted Data    │ Variable length (optionally compressed)  │
+├──────────────────────────────────────────────────────────────┤
+│ File HMAC         │ 32 bytes (HMAC-SHA256, multi-chunk only) │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 The format uses a split header design:
@@ -59,14 +59,14 @@ Public and private headers use Protocol Buffer format:
 ```rust
 // Public Header (unencrypted)
 {
-  "version": 0,                           // File format version
-  "encryption_algorithm": "AES-256-GCM",  // Encryption method
-  "kdf_config": {                         // Key derivation configuration
+  "version": 0,                            // File format version
+  "encryption_algorithm": "AES-256-GCM",   // Encryption method
+  "kdf_config": {                          // Key derivation configuration
     "standard_kdf": "ARGON2ID_RECOMMENDED" // Preset (2GB, 1 iter, 4 threads)
   },
-  "salt": [32 bytes],                     // Random salt for key derivation
-  "nonce": [8/16 bytes],                  // Base nonce for chunked encryption
-  "chunk_size": 65536,                    // Chunk size in bytes (64KB default)
+  "salt": [32 bytes],                      // Random salt for key derivation
+  "nonce": [8/16 bytes],                   // Base nonce for chunked encryption
+  "chunk_size": 65536,                     // Chunk size in bytes (64KB default)
 }
 
 // Private Header (encrypted as part of data stream)
