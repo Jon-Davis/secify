@@ -67,17 +67,14 @@ impl<W: Write> StreamingEncryptionWriter<W> {
         algorithm: EncryptionAlgorithm,
         key: [u8; KEY_LENGTH],
         base_nonce: Vec<u8>,
-        salt: &[u8],
     ) -> Result<Self> {
         let auth_tag_size = algorithm.auth_tag_size();
         let chunk_size = DEFAULT_CHUNK_SIZE - auth_tag_size;
         
-        // Create HMAC for integrity
-        let mut hmac_key = Vec::with_capacity(KEY_LENGTH + salt.len());
-        hmac_key.extend_from_slice(&key);
-        hmac_key.extend_from_slice(salt);
-        let hmac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
-            .map_err(|e| SecifyError::crypto(format!("Failed to create HMAC: {}", e)))?;
+        // Use the derived key (Argon2 output) as HMAC salt instead of the original salt
+        // This ties HMAC computation to the password, preventing static file discovery
+        let hmac = Hmac::<Sha256>::new_from_slice(&key)
+            .map_err(|_| SecifyError::crypto("Failed to create HMAC".to_string()))?;
         
         Ok(Self {
             inner,
@@ -190,7 +187,6 @@ impl<R: Read> StreamingDecryptionReader<R> {
         algorithm: EncryptionAlgorithm,
         key: [u8; KEY_LENGTH],
         base_nonce: Vec<u8>,
-        salt: &[u8],
         file_size: u64,
     ) -> Result<Self> {
         let chunk_size = DEFAULT_CHUNK_SIZE;
@@ -198,12 +194,10 @@ impl<R: Read> StreamingDecryptionReader<R> {
         // Don't subtract HMAC size initially - we'll determine if it exists during reading
         // based on whether we have multiple chunks
         
-        // Create HMAC for integrity
-        let mut hmac_key = Vec::with_capacity(KEY_LENGTH + salt.len());
-        hmac_key.extend_from_slice(&key);
-        hmac_key.extend_from_slice(salt);
-        let hmac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
-            .map_err(|e| SecifyError::crypto(format!("Failed to create HMAC: {}", e)))?;
+        // Use the derived key (Argon2 output) as HMAC salt instead of the original salt
+        // This ties HMAC computation to the password, preventing static file discovery
+        let hmac = Hmac::<Sha256>::new_from_slice(&key)
+            .map_err(|_| SecifyError::crypto("Failed to create HMAC".to_string()))?;
 
         Ok(Self {
             inner,
@@ -446,7 +440,6 @@ pub fn encrypt_core(
         algorithm.clone(),
         key,
         base_nonce,
-        &salt,
     )?;
 
     // Write encrypted payload header as first part of encrypted stream
@@ -620,7 +613,6 @@ pub fn decrypt_core(
         algorithm.clone(),
         key,
         header.nonce.clone(),
-        &header.salt,
         ciphertext_size,
     )?;
     
@@ -775,7 +767,6 @@ pub fn decrypt_core(
         verification_algorithm,
         key,
         header.nonce,
-        &header.salt,
         ciphertext_size,
     )?;
     

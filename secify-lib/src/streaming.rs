@@ -31,12 +31,13 @@ impl<W: Write> StreamingEncryptionWriter<W> {
         algorithm: EncryptionAlgorithm,
         key: [u8; KEY_LENGTH],
         base_nonce: Vec<u8>,
-        salt: &[u8],
     ) -> Result<Self> {
         let auth_tag_size = algorithm.auth_tag_size();
         let chunk_size = DEFAULT_CHUNK_SIZE - auth_tag_size;
         
-        let hmac = Hmac::<Sha256>::new_from_slice(salt)
+        // Use the derived key (Argon2 output) as HMAC salt instead of the original salt
+        // This ties HMAC computation to the password, preventing static file discovery
+        let hmac = Hmac::<Sha256>::new_from_slice(&key)
             .map_err(|_| SecifyError::crypto("Failed to create HMAC".to_string()))?;
         
         Ok(Self {
@@ -127,11 +128,12 @@ impl<R: Read> StreamingDecryptionReader<R> {
         algorithm: EncryptionAlgorithm,
         key: [u8; KEY_LENGTH],
         base_nonce: Vec<u8>,
-        salt: &[u8],
     ) -> Result<Self> {
         let chunk_size = DEFAULT_CHUNK_SIZE;
         
-        let hmac = Hmac::<Sha256>::new_from_slice(salt)
+        // Use the derived key (Argon2 output) as HMAC salt instead of the original salt
+        // This ties HMAC computation to the password, preventing static file discovery
+        let hmac = Hmac::<Sha256>::new_from_slice(&key)
             .map_err(|_| SecifyError::crypto("Failed to create HMAC".to_string()))?;
         
         Ok(Self {

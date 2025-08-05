@@ -9,7 +9,6 @@ use hmac::{Hmac, Mac};
 const TEST_KEY: [u8; KEY_LENGTH] = [0x11; KEY_LENGTH];
 const TEST_NONCE_AES: [u8; 8] = [0x22; 8];
 const TEST_NONCE_XCHACHA: [u8; 16] = [0x22; 16];
-const TEST_SALT: [u8; 32] = [0x33; 32];
 
 #[test]
 fn test_hmac_computed_on_plaintext_during_encryption() {
@@ -22,15 +21,14 @@ fn test_hmac_computed_on_plaintext_during_encryption() {
         EncryptionAlgorithm::Aes256Gcm,
         TEST_KEY,
         TEST_NONCE_AES.to_vec(),
-        &TEST_SALT,
     ).unwrap();
     
     // Write data using the Write trait (this is the correct way)
     writer.write_all(plaintext).unwrap();
     writer.finish().unwrap();
     
-    // Calculate expected HMAC on plaintext
-    let mut expected_hmac = Hmac::<Sha256>::new_from_slice(&TEST_SALT).unwrap();
+    // Calculate expected HMAC on plaintext using the key (not salt)
+    let mut expected_hmac = Hmac::<Sha256>::new_from_slice(&TEST_KEY).unwrap();
     expected_hmac.update(plaintext);
     let expected_tag = expected_hmac.finalize().into_bytes();
     
@@ -58,7 +56,6 @@ fn test_hmac_verified_on_plaintext_during_decryption() {
             algorithm,
             TEST_KEY,
             nonce.clone(),
-            &TEST_SALT,
         ).unwrap();
         writer.write_all(plaintext).unwrap();
         writer.finish().unwrap();
@@ -68,8 +65,8 @@ fn test_hmac_verified_on_plaintext_during_decryption() {
     assert!(encrypted_output.len() > plaintext.len(), "Encrypted data should be larger");
     assert!(encrypted_output.len() >= 32, "Should have HMAC at end");
     
-    // Calculate what the HMAC should be for the plaintext
-    let mut expected_hmac = Hmac::<Sha256>::new_from_slice(&TEST_SALT).unwrap();
+    // Calculate what the HMAC should be for the plaintext using the key (not salt)
+    let mut expected_hmac = Hmac::<Sha256>::new_from_slice(&TEST_KEY).unwrap();
     expected_hmac.update(plaintext);
     let expected_tag = expected_hmac.finalize().into_bytes();
     
@@ -85,7 +82,6 @@ fn test_hmac_verified_on_plaintext_during_decryption() {
             EncryptionAlgorithm::Aes256Gcm,
             TEST_KEY,
             nonce,
-            &TEST_SALT,
         ).unwrap();
         
         let mut decrypted = Vec::new();
@@ -115,7 +111,6 @@ fn test_hmac_verification_fails_with_corrupted_data() {
             EncryptionAlgorithm::XChaCha20Poly1305,
             TEST_KEY,
             TEST_NONCE_XCHACHA.to_vec(),
-            &TEST_SALT,
         ).unwrap();
         writer.write_all(plaintext).unwrap();
         writer.finish().unwrap();
@@ -131,7 +126,6 @@ fn test_hmac_verification_fails_with_corrupted_data() {
         EncryptionAlgorithm::XChaCha20Poly1305,
         TEST_KEY,
         TEST_NONCE_XCHACHA.to_vec(),
-        &TEST_SALT,
     );
     
     // The reader creation itself might succeed, but reading should fail

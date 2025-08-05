@@ -179,7 +179,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{EncryptionAlgorithm, generate_base_nonce, generate_secure_random_bytes, KEY_LENGTH, SALT_LENGTH};
+    use crate::crypto::{EncryptionAlgorithm, generate_base_nonce, KEY_LENGTH};
     use std::io::Cursor;
 
     #[test]
@@ -190,8 +190,6 @@ mod tests {
         // Create encryption writer
         let output_buffer = Vec::new();
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
-        let mut salt = [0u8; SALT_LENGTH];
-        generate_secure_random_bytes(&mut salt).unwrap();
         let base_nonce = generate_base_nonce(&algorithm).unwrap();
         let key = [1u8; KEY_LENGTH]; // Test key
         
@@ -200,7 +198,6 @@ mod tests {
             algorithm,
             key,
             base_nonce,
-            &salt,
         ).unwrap();
         
         // Create compression config
@@ -234,8 +231,6 @@ mod tests {
         
         let output_buffer = Vec::new();
         let algorithm = EncryptionAlgorithm::XChaCha20Poly1305;
-        let mut salt = [0u8; SALT_LENGTH];
-        generate_secure_random_bytes(&mut salt).unwrap();
         let base_nonce = generate_base_nonce(&algorithm).unwrap();
         let key = [1u8; KEY_LENGTH];
         
@@ -244,7 +239,6 @@ mod tests {
             algorithm,
             key,
             base_nonce,
-            &salt,
         ).unwrap();
         
         // Create compression writer without compression
