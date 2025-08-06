@@ -118,16 +118,16 @@ File entry format:
 ├─────────────────────────────────────────────────────────────┤
 │ Name Length      │ 2 bytes (little-endian u16)              │
 ├─────────────────────────────────────────────────────────────┤
-│ File Name        │ Variable length (UTF-8 string)           │
+│ File Size        │ 6 bytes (little-endian, max 281TB)       │
 ├─────────────────────────────────────────────────────────────┤
-│ File Size        │ 8 bytes (little-endian u64)              │
+│ File Name        │ Variable length (UTF-8 string)           │
 ├─────────────────────────────────────────────────────────────┤
 │ File Data        │ Variable length (raw file content)       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Archive Details:**
-- Overhead: 10 bytes + filename length per file
+- Overhead: 8 bytes + filename length per file
 - Sequential processing, no seeking required
 - Relative paths preserved for directory reconstruction
 - No block padding
@@ -152,9 +152,9 @@ project/
 
 The sec archive would contain:
 ```
-[12]["src/main.rs"][1024][...file data...]
-[8]["src/lib.rs"][512][...file data...]
-[9]["README.md"][256][...file data...]
+[12][1024]["src/main.rs"][...file data...]
+[8][512]["src/lib.rs"][...file data...]
+[9][256]["README.md"][...file data...]
 ```
 
 ### File Integrity Protection

@@ -3,7 +3,7 @@
 //! This module provides a lightweight streaming archive format specifically designed
 //! for efficient encryption and archival without the overhead of traditional formats like TAR.
 //!
-//! Format: [name_len: u16][name: utf8][size: u64][data]
+//! Format: [name_len: u16][name: utf8][size: 6 bytes][data]
 
 use std::fs::{self, File};
 use std::path::Path;
@@ -12,7 +12,7 @@ use crate::error::{SecifyError, Result};
 use crate::progress::EncryptProgress;
 
 /// Custom sec archive writer for minimal overhead
-/// Format: [name_len: u16][name: utf8][size: u64][data]
+/// Format: [name_len: u16][name: utf8][size: 6 bytes][data]
 pub struct SecArchiveWriter<W: Write> {
     writer: W,
 }
@@ -23,13 +23,22 @@ impl<W: Write> SecArchiveWriter<W> {
     }
     
     pub fn add_file(&mut self, path: &str, size: u64, mut reader: impl Read) -> std::io::Result<()> {
+        // Check if file size exceeds 6-byte limit (281 TB)
+        if size > 0xFFFF_FFFF_FFFF {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("File size {} exceeds maximum supported size of 281TB", size)
+            ));
+        }
+        
         // Write name length and name
         let name_bytes = path.as_bytes();
         self.writer.write_all(&(name_bytes.len() as u16).to_le_bytes())?;
         self.writer.write_all(name_bytes)?;
         
-        // Write file size
-        self.writer.write_all(&size.to_le_bytes())?;
+        // Write file size as 6 bytes (little-endian)
+        let size_bytes = size.to_le_bytes();
+        self.writer.write_all(&size_bytes[..6])?; // Only write first 6 bytes
         
         // Copy file data
         std::io::copy(&mut reader, &mut self.writer)?;
@@ -72,10 +81,13 @@ impl<R: Read> SecArchiveReader<R> {
         let name = String::from_utf8(name_bytes)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in filename"))?;
         
-        // Read file size
-        let mut size_bytes = [0u8; 8];
+        // Read file size (6 bytes, little-endian)
+        let mut size_bytes = [0u8; 6];
         self.reader.read_exact(&mut size_bytes)?;
-        let size = u64::from_le_bytes(size_bytes);
+        // Convert 6 bytes to u64 by padding with zeros
+        let mut size_u64_bytes = [0u8; 8];
+        size_u64_bytes[..6].copy_from_slice(&size_bytes);
+        let size = u64::from_le_bytes(size_u64_bytes);
         
         Ok(Some((name, size)))
     }
